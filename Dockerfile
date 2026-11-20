@@ -42,7 +42,7 @@ RUN curl -fsSL -o ffmpeg.tar.xz "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VER
 # Only what the bot and yt-dlp use:
 # - crates/media/src/ffmpeg.rs: remux (-c copy to mp4), ugoira (concat of
 #   jpg/png frames -> libx264), transcode (libx264 + aac, scale), thumbnail
-#   (mjpeg), probe (ffprobe JSON);
+#   (mjpeg), photo resizing (mjpeg/png), probe (ffprobe JSON);
 # - yt-dlp: merging video+audio into mp4 and extracting m4a audio.
 # Decoders cover the codecs these sites serve (AV1 through libdav1d), so
 # transcoding works whatever the source. Add components here when the code
@@ -53,13 +53,13 @@ RUN ./configure \
       --disable-doc --disable-debug --disable-ffplay \
       --enable-gpl --enable-libx264 --enable-libdav1d --enable-zlib \
       --enable-protocol=file,pipe \
-      --enable-demuxer=mov,matroska,flv,mpegts,mp3,aac,ogg,wav,concat,image2,image_jpeg_pipe,image_png_pipe,image_webp_pipe,gif \
+      --enable-demuxer=mov,matroska,flv,mpegts,mp3,aac,ogg,wav,concat,image2,image_jpeg_pipe,image_png_pipe,image_webp_pipe,gif,apng \
       --enable-muxer=mp4,mov,ipod,matroska,webm,adts,image2,mjpeg,null \
-      --enable-decoder=h264,hevc,vp8,vp9,libdav1d,aac,aac_latm,mp3,mp3float,opus,vorbis,flac,pcm_s16le,mjpeg,png,webp,gif \
-      --enable-encoder=libx264,aac,mjpeg \
+      --enable-decoder=h264,hevc,vp8,vp9,libdav1d,aac,aac_latm,mp3,mp3float,opus,vorbis,flac,pcm_s16le,mjpeg,png,webp,gif,apng \
+      --enable-encoder=libx264,aac,mjpeg,png \
       --enable-parser=h264,hevc,vp8,vp9,av1,aac,aac_latm,mpegaudio,opus,vorbis,flac,mjpeg,png,webp,gif \
       --enable-bsfs \
-      --enable-filter=scale,format,null,anull,aformat,aresample,copy,acopy \
+      --enable-filter=scale,hflip,vflip,transpose,format,null,anull,aformat,aresample,copy,acopy \
     && make -j"$(nproc)" \
     && make install
 

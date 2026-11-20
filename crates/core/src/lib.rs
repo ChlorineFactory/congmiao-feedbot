@@ -18,7 +18,10 @@ pub use extract::{
     MediaSource, RequesterInfo, Scope, SiteMeta, UgoiraFrame,
 };
 pub use job::{Job, JobState, MediaCacheEntry, PublishError, Publisher, Subscription, WorkEnqueue};
-pub use media::{MediaError, MediaInfo, MediaProcessor, TranscodeSpec, Ytdlp, YtdlpSpec};
+pub use media::{
+    MediaError, MediaInfo, MediaProcessor, PhotoEncoding, PhotoFormat, PhotoInfo, TranscodeSpec,
+    Ytdlp, YtdlpSpec,
+};
 pub use options::{
     OptionDef, OptionDefault, OptionError, OptionKind, OptionSpec, OptionValue, OptionValues,
     apply_to_layer, fold_fullwidth, merge_layers, parse_tokens, split_option_tokens,

@@ -32,6 +32,9 @@ for i in 1 2 3; do                                        # odd-sized ugoira fra
   $F -f lavfi -i testsrc2=size=101x75:rate=1:duration=5 -ss $i -frames:v 1 00000$i.jpg
 done
 $F -f lavfi -i testsrc2=size=101x75 -frames:v 1 000004.png
+$F -f lavfi -i color=c=red@0.5:s=100x76,format=rgba -frames:v 1 transparent.png
+$F -f lavfi -i testsrc2=size=90x120 -frames:v 1 -c:v libwebp portrait.webp
+$F -f lavfi -i testsrc2=size=100x76:rate=2:duration=1 -f apng animated.png
 chown "$OWNER" ./*
 '
 
@@ -55,6 +58,13 @@ ok "remux DASH h264+aac" "$F -i v.m4s -i a.m4s -c copy -movflags +faststart bili
 ok "remux flv"           "$F -i durl.flv -c copy -movflags +faststart flv.mp4"
 ok "ffprobe json"        "ffprobe -v quiet -print_format json -show_format -show_streams bili.mp4 | grep -q \"\\\"width\\\": 640\""
 ok "thumbnail"           "$F -ss 0 -i bili.mp4 -vframes 1 -vf \"scale='\''min(320,iw)'\'':-2\" -q:v 3 thumb.jpg"
+# Static photo processing.
+portrait_scale="scale='\''if(gte(iw,ih),96,72)'\'':'\''if(gte(iw,ih),72,96)'\'':flags=lanczos"
+ok "resize WebP to JPEG" "$F -i portrait.webp -map 0:v:0 -frames:v 1 -vf \"$portrait_scale\" -c:v mjpeg -pix_fmt yuvj444p -q:v 2 -update 1 photo.jpg"
+ok "probe portrait JPEG" "ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0 photo.jpg | grep -qx 72,96"
+ok "resize alpha PNG"    "$F -i transparent.png -map 0:v:0 -frames:v 1 -vf scale=50:38:flags=lanczos -c:v png -pix_fmt rgba -compression_level 9 -update 1 photo.png"
+ok "probe resized PNG"   "ffprobe -v error -select_streams v:0 -show_entries stream=width,height,pix_fmt -of csv=p=0 photo.png | grep -qx 50,38,rgba"
+ok "probe APNG"          "ffprobe -v error -f apng -show_entries format=format_name -of csv=p=0 animated.png | grep -qx apng"
 # yt-dlp post-processing: merge VP9+Opus into mp4, extract m4a.
 ok "merge vp9+opus"      "$F -i v.webm -i a.webm -map 0:v:0 -map 1:a:0 -c copy -movflags +faststart yt.mp4"
 ok "extract m4a"         "$F -i a.webm -vn -c:a aac -b:a 128k -f ipod audio.m4a"

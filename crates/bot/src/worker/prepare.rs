@@ -2,11 +2,24 @@
 
 use crate::app::{App, MediaTools};
 use feedbot_core::extract::{MediaItem, MediaKind, MediaSource};
-use feedbot_core::{MediaError, MediaInfo, TranscodeSpec, YtdlpSpec};
+use feedbot_core::{
+    MediaError, MediaInfo, MediaProcessor, PhotoEncoding, PhotoFormat, PhotoInfo, TranscodeSpec,
+    YtdlpSpec,
+};
 use http::HeaderMap;
 use std::path::{Path, PathBuf};
 use tokio::task::JoinSet;
 use tracing::warn;
+
+const TELEGRAM_PHOTO_MAX_BYTES: u64 = 10_000_000;
+const TELEGRAM_PHOTO_MAX_EDGE_SUM: u64 = 10_000;
+const TELEGRAM_PHOTO_MAX_ASPECT: u64 = 20;
+
+pub(super) fn telegram_photo_max_bytes(tools: &MediaTools) -> u64 {
+    TELEGRAM_PHOTO_MAX_BYTES
+        .min(tools.max_photo_bytes)
+        .min(tools.max_upload_bytes)
+}
 
 pub(super) async fn prepare_all(
     app: &App,
@@ -65,6 +78,7 @@ pub(super) struct PreparedMedia {
     pub(super) kind: MediaKind,
     pub(super) path: PathBuf,
     pub(super) filename: Option<String>,
+    pub(super) cacheable: bool,
     pub(super) probe: Option<MediaInfo>,
     pub(super) thumbnail: Option<PathBuf>,
 }
@@ -80,7 +94,6 @@ async fn prepare_one(
         processor: media,
         ytdlp,
         max_upload_bytes,
-        max_photo_bytes,
         ..
     } = tools;
     let mut thumb_url = item.cover.clone();
@@ -166,8 +179,27 @@ async fn prepare_one(
     }
 
     let mut size = file_size(&path).await?;
-    if kind == MediaKind::Photo && size > *max_photo_bytes {
-        kind = MediaKind::Document;
+    let mut cacheable = true;
+    if kind == MediaKind::Photo {
+        let work_dir = dir.join(format!("photo-{idx}"));
+        let max_bytes = telegram_photo_max_bytes(tools);
+        match prepare_photo(&path, size, &work_dir, media.as_ref(), max_bytes).await {
+            Ok(Some((photo_path, photo_size))) => {
+                if photo_path != path {
+                    filename = photo_path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned());
+                    path = photo_path;
+                }
+                size = photo_size;
+            }
+            Ok(None) => kind = MediaKind::Document,
+            Err(error) => {
+                warn!(idx, %error, "photo preparation failed; keeping original");
+                kind = MediaKind::Document;
+                cacheable = false;
+            }
+        }
     }
 
     if matches!(kind, MediaKind::Video | MediaKind::Animation) && size > *max_upload_bytes {
@@ -212,9 +244,99 @@ async fn prepare_one(
         kind,
         path,
         filename,
+        cacheable,
         probe,
         thumbnail,
     }))
+}
+
+async fn prepare_photo(
+    original: &Path,
+    size: u64,
+    work_dir: &Path,
+    media: &dyn MediaProcessor,
+    max_bytes: u64,
+) -> Result<Option<(PathBuf, u64)>, MediaError> {
+    let Some(photo) = media.probe_photo(original).await? else {
+        return Ok(None);
+    };
+    let (long, short) = photo_edges(photo);
+    if short == 0 || long > TELEGRAM_PHOTO_MAX_ASPECT * short {
+        return Ok(None);
+    }
+
+    if long + short <= TELEGRAM_PHOTO_MAX_EDGE_SUM
+        && size <= max_bytes
+        && matches!(photo.format, PhotoFormat::Jpeg | PhotoFormat::Png)
+    {
+        return Ok(Some((original.to_path_buf(), size)));
+    }
+
+    let mut edge_sum = (long + short).min(TELEGRAM_PHOTO_MAX_EDGE_SUM);
+    let mut attempts = Vec::new();
+    if photo.may_have_alpha || matches!(photo.format, PhotoFormat::Png) {
+        attempts.push((edge_sum, PhotoEncoding::Png));
+    }
+    if !photo.may_have_alpha {
+        for quality in [100, 88, 72] {
+            attempts.push((edge_sum, PhotoEncoding::Jpeg { quality }));
+        }
+    }
+    let resize_encoding = if photo.may_have_alpha {
+        PhotoEncoding::Png
+    } else {
+        PhotoEncoding::Jpeg { quality: 88 }
+    };
+    for _ in 0..4 {
+        edge_sum = edge_sum * 3 / 4;
+        if edge_sum < 2 {
+            break;
+        }
+        attempts.push((edge_sum, resize_encoding));
+    }
+
+    tokio::fs::create_dir(work_dir)
+        .await
+        .map_err(|e| MediaError::Io(e.to_string()))?;
+    for (target_sum, encoding) in attempts {
+        let (long_edge, short_edge) = fit_photo_edges(long, short, target_sum);
+        let output = work_dir.join(match encoding {
+            PhotoEncoding::Jpeg { .. } => "photo.jpg",
+            PhotoEncoding::Png => "photo.png",
+        });
+        media
+            .encode_photo(original, &output, long_edge, short_edge, encoding)
+            .await?;
+        let size = file_size(&output).await?;
+        if size > 0
+            && size <= max_bytes
+            && let Some(encoded) = media.probe_photo(&output).await?
+        {
+            let (long, short) = photo_edges(encoded);
+            if short > 0
+                && long + short <= TELEGRAM_PHOTO_MAX_EDGE_SUM
+                && long <= TELEGRAM_PHOTO_MAX_ASPECT * short
+            {
+                return Ok(Some((output, size)));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn photo_edges(photo: PhotoInfo) -> (u64, u64) {
+    (
+        u64::from(photo.width.max(photo.height)),
+        u64::from(photo.width.min(photo.height)),
+    )
+}
+
+fn fit_photo_edges(long: u64, short: u64, target_sum: u64) -> (u32, u32) {
+    let sum = long + short;
+    let long_edge = (long * target_sum / sum).max(1);
+    // Rounding the short edge down can push a valid panorama past 20:1.
+    let short_edge = (short * target_sum / sum).max(long_edge.div_ceil(TELEGRAM_PHOTO_MAX_ASPECT));
+    (long_edge as u32, short_edge as u32)
 }
 
 async fn file_size(path: &Path) -> Result<u64, MediaError> {
@@ -231,3 +353,6 @@ fn safe_name(name: Option<&str>, idx: usize) -> String {
         .map(|s| format!("{idx}_{s}"))
         .unwrap_or_else(|| format!("item_{idx}"))
 }
+
+#[cfg(test)]
+mod tests;

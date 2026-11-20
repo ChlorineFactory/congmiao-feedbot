@@ -59,6 +59,16 @@ export FEEDBOT__TELEGRAM__WEBHOOK__PUBLIC_URL=https://example.com
 export FEEDBOT__TELEGRAM__WEBHOOK__SECRET_TOKEN=...
 ```
 
+Static images use the best source the extractor can find. Pixiv uses the original
+by default and accepts `+q:regular` for the smaller variant. For YouTube live
+covers, the bot picks the largest thumbnail with reported dimensions.
+
+Compatible images are uploaded directly as Telegram photos. FFmpeg scales
+oversized dimensions proportionally to a width plus height of at most 10,000
+pixels, then compresses further if needed to meet `output.max_photo_bytes`
+(up to 10,000,000 bytes). Images with an aspect ratio over 20:1 or that cannot
+be converted are sent as original files when they fit `output.max_upload_bytes`.
+
 Posts with more than `output.summary_threshold` items are sent as several albums by default. With `output.overflow = "telegraph"`, a set made only of photos is published as one telegra.ph page instead, and the chat gets the caption plus the page link. Nothing is downloaded or uploaded for such posts. With `+sp` the link preview is turned off.
 
 Telegraph no longer accepts image uploads, so the page links the original image URLs. Hosts that need a Referer or cookie (Pixiv, Bilibili) only show through a proxy host. A post that cannot be shown this way, or a Telegraph error, falls back to albums. The proxy in this example is a third-party service:

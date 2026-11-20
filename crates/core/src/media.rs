@@ -1,4 +1,4 @@
-//! Media processing contract (probe / remux / thumbnail / transcode).
+//! Media processing contract (probe / remux / image encoding / transcode).
 
 use crate::extract::UgoiraFrame;
 use serde_json::Value;
@@ -15,6 +15,27 @@ pub struct MediaInfo {
     pub video_codec: Option<String>,
     pub audio_codec: Option<String>,
     pub size_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum PhotoFormat {
+    Jpeg,
+    Png,
+    Webp,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PhotoInfo {
+    pub width: u32,
+    pub height: u32,
+    pub format: PhotoFormat,
+    pub may_have_alpha: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum PhotoEncoding {
+    Jpeg { quality: u8 },
+    Png,
 }
 
 #[derive(Debug, Clone)]
@@ -79,6 +100,17 @@ pub trait Ytdlp: Send + Sync {
 #[async_trait::async_trait]
 pub trait MediaProcessor: Send + Sync {
     async fn probe(&self, path: &Path) -> Result<MediaInfo, MediaError>;
+    /// Inspect a supported single-frame image. Unknown formats and animations return `None`.
+    async fn probe_photo(&self, path: &Path) -> Result<Option<PhotoInfo>, MediaError>;
+    /// Encode at the given edge lengths, retaining the display orientation.
+    async fn encode_photo(
+        &self,
+        input: &Path,
+        output: &Path,
+        long_edge: u32,
+        short_edge: u32,
+        encoding: PhotoEncoding,
+    ) -> Result<(), MediaError>;
     async fn remux(&self, inputs: &[PathBuf], output: &Path) -> Result<(), MediaError>;
     async fn thumbnail(&self, input: &Path, output: &Path) -> Result<(), MediaError>;
     async fn transcode(

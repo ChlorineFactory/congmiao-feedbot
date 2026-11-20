@@ -36,9 +36,9 @@ const SPEC: OptionSpec = OptionSpec {
             kind: OptionKind::Enum {
                 variants: &["original", "regular"],
             },
-            default: Some(OptionDefault::Enum("regular")),
+            default: Some(OptionDefault::Enum("original")),
             affects_output: true,
-            desc: "原图或 master1200。默认 regular，避免超 10MB 被降级成文件",
+            desc: "默认原图，regular 使用 master1200",
         },
         OptionDef {
             name: "p",
@@ -166,7 +166,7 @@ impl Extractor for PixivExtractor {
         let canonical_url = Url::parse(&format!("https://www.pixiv.net/artworks/{id}"))
             .map_err(|e| ExtractError::Failed(e.to_string()))?;
         let want_original =
-            matches!(req.options.get("q"), Some(OptionValue::Enum(q)) if q == "original");
+            !matches!(req.options.get("q"), Some(OptionValue::Enum(q)) if q == "regular");
         let page_range = match req.options.get("p") {
             Some(OptionValue::IntRange { start, end }) => Some((*start, *end)),
             _ => None,
@@ -213,13 +213,12 @@ async fn illust_items(
     };
     let mut items = Vec::with_capacity(pages.len());
     for (idx, page) in pages.into_iter().enumerate() {
-        let Some(raw) = pick_url(&page.urls, want_original) else {
+        let Some(url) = pick_url(&page.urls, want_original) else {
             return Err(ExtractError::Failed(format!(
-                "第 {} 页缺少图片地址",
+                "第 {} 页没有有效的图片地址",
                 idx + 1
             )));
         };
-        let url = Url::parse(raw).map_err(|e| ExtractError::Failed(e.to_string()))?;
         let filename = last_path_segment(&url);
         items.push(MediaItem {
             id: format!("{id}_p{idx}"),
@@ -374,12 +373,17 @@ fn parse_illust_id(url: &Url) -> Option<u64> {
     None
 }
 
-fn pick_url(urls: &UrlSet, original: bool) -> Option<&str> {
-    if original {
-        urls.original.as_deref().or(urls.regular.as_deref())
+fn pick_url(urls: &UrlSet, original: bool) -> Option<Url> {
+    let variants = if original {
+        [&urls.original, &urls.regular]
     } else {
-        urls.regular.as_deref().or(urls.original.as_deref())
-    }
+        [&urls.regular, &urls.original]
+    };
+    variants
+        .into_iter()
+        .filter_map(Option::as_deref)
+        .filter_map(|raw| Url::parse(raw).ok())
+        .find(|url| matches!(url.scheme(), "http" | "https"))
 }
 
 fn tags_from_body(body: &IllustBody) -> Vec<String> {
@@ -936,24 +940,40 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn single_page_uses_detail_urls() {
-            let http = Arc::new(FakeHttp::new().json(
-                DETAIL,
-                ok(json!({ "illustTitle": "t", "pageCount": 1, "urls": page(0)["urls"] })),
-            ));
-            let ext = PixivExtractor::new(http.clone());
-            let req = request(
-                "pixiv",
-                "https://www.pixiv.net/i/7",
-                options(&ext, &[]),
-                None,
-            );
-            let extracted = ext.extract(&http.ctx(), &req).await.unwrap();
-            let MediaSource::Direct { url, .. } = &extracted.items[0].source else {
-                panic!();
-            };
-            assert!(url.as_str().ends_with("7_p0_master1200.jpg"));
-            assert_eq!(http.urls().len(), 1);
+        async fn single_page_uses_detail_urls_for_requested_quality() {
+            let original = "https://i.pximg.net/img-original/7_p0.png";
+            let regular = "https://i.pximg.net/img-master/7_p0_master1200.jpg";
+            let both = page(0)["urls"].clone();
+            for (urls, tokens, expected_url) in [
+                (both.clone(), Some(&[][..]), original),
+                (both.clone(), Some(&["+q:regular"][..]), regular),
+                (both, None, original),
+                (json!({ "regular": regular }), Some(&[][..]), regular),
+                (
+                    json!({ "original": "", "regular": regular }),
+                    Some(&[][..]),
+                    regular,
+                ),
+                (
+                    json!({ "original": "file:///image.png", "regular": regular }),
+                    Some(&[][..]),
+                    regular,
+                ),
+            ] {
+                let http = Arc::new(FakeHttp::new().json(
+                    DETAIL,
+                    ok(json!({ "illustTitle": "t", "pageCount": 1, "urls": urls })),
+                ));
+                let ext = PixivExtractor::new(http.clone());
+                let options = tokens.map_or_else(OptionValues::new, |tokens| options(&ext, tokens));
+                let req = request("pixiv", "https://www.pixiv.net/i/7", options, None);
+                let extracted = ext.extract(&http.ctx(), &req).await.unwrap();
+                let MediaSource::Direct { url, .. } = &extracted.items[0].source else {
+                    panic!("{:?}", extracted.items[0].source);
+                };
+                assert_eq!(url.as_str(), expected_url, "tokens: {tokens:?}");
+                assert_eq!(http.urls().len(), 1);
+            }
         }
 
         #[tokio::test]

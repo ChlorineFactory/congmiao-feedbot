@@ -202,7 +202,16 @@ fn extracted_from_probe(
         _ => Some(1080),
     };
     let item = if is_live {
-        let url = thumb.ok_or_else(|| ExtractError::Failed("直播没有封面".into()))?;
+        let url = largest_thumbnail_url(&json)
+            .or(thumb)
+            .ok_or_else(|| ExtractError::Failed("直播没有封面".into()))?;
+        let extension = url
+            .path()
+            .rsplit_once('.')
+            .map(|(_, extension)| extension)
+            .filter(|extension| matches!(*extension, "avif" | "jpeg" | "png" | "webp"))
+            .unwrap_or("jpg");
+        let filename = format!("live.{extension}");
         MediaItem {
             id: id.to_string(),
             kind: MediaKind::Photo,
@@ -210,7 +219,7 @@ fn extracted_from_probe(
                 url,
                 headers: HeaderMap::new(),
             },
-            filename: Some("live.jpg".into()),
+            filename: Some(filename),
             cover: None,
         }
     } else if music {
@@ -267,6 +276,21 @@ fn thumbnail_url(json: &Value, id: &str) -> Option<Url> {
                 .and_then(|s| Url::parse(s).ok())
         })
         .or_else(|| Url::parse(&format!("https://i.ytimg.com/vi/{id}/maxresdefault.jpg")).ok())
+}
+
+fn largest_thumbnail_url(json: &Value) -> Option<Url> {
+    json.get("thumbnails")?
+        .as_array()?
+        .iter()
+        .filter_map(|thumbnail| {
+            let width = thumbnail.get("width")?.as_u64()?;
+            let height = thumbnail.get("height")?.as_u64()?;
+            let pixels = width.checked_mul(height).filter(|&pixels| pixels > 0)?;
+            let url = Url::parse(thumbnail.get("url")?.as_str()?).ok()?;
+            matches!(url.scheme(), "http" | "https").then_some((pixels, url))
+        })
+        .max_by_key(|(pixels, _)| *pixels)
+        .map(|(_, url)| url)
 }
 
 /// `youtu.be/{id}` → `youtube.com/watch?v={id}`, plus host aliases.
@@ -629,13 +653,23 @@ mod tests {
                 "title": "live now",
                 "is_live": true,
                 "live_status": "is_live",
-                "thumbnail": "https://i.ytimg.com/vi/jNQXAC9IVRw/maxresdefault.jpg"
+                "thumbnail": "https://i.ytimg.com/vi/jNQXAC9IVRw/hqdefault.jpg",
+                "thumbnails": [
+                    { "url": "https://i.ytimg.com/vi_webp/jNQXAC9IVRw/maxresdefault.webp", "width": 1280, "height": 720 },
+                    { "url": "https://i.ytimg.com/vi/jNQXAC9IVRw/hqdefault.jpg", "width": 480, "height": 360 },
+                    { "url": "file:///thumbnail.jpg", "width": 1920, "height": 1080 }
+                ]
             }),
             &opts,
         )
         .unwrap();
         assert_eq!(live.items[0].kind, MediaKind::Photo);
-        assert!(matches!(live.items[0].source, MediaSource::Direct { .. }));
+        assert!(matches!(
+            &live.items[0].source,
+            MediaSource::Direct { url, .. }
+                if url.path() == "/vi_webp/jNQXAC9IVRw/maxresdefault.webp"
+        ));
+        assert_eq!(live.items[0].filename.as_deref(), Some("live.webp"));
 
         let music = extracted_from_probe(
             &url("https://music.youtube.com/watch?v=jNQXAC9IVRw"),
@@ -664,6 +698,31 @@ mod tests {
         }
         assert_eq!(music.engagement.as_ref().unwrap().views, Some(12));
         assert_eq!(music.canonical_url.host_str(), Some("music.youtube.com"));
+    }
+
+    #[test]
+    fn live_uses_default_thumbnail_without_valid_candidate_dimensions() {
+        let thumbnail = "https://i.ytimg.com/vi/jNQXAC9IVRw/hqdefault_live.jpg";
+        let live = extracted_from_probe(
+            &url("https://youtube.com/watch?v=jNQXAC9IVRw"),
+            "jNQXAC9IVRw",
+            None,
+            serde_json::json!({
+                "live_status": "is_live",
+                "thumbnail": thumbnail,
+                "thumbnails": [
+                    { "url": "https://i.ytimg.com/vi/jNQXAC9IVRw/maxresdefault_live.jpg", "width": 1280 },
+                    { "url": "https://i.ytimg.com/vi/jNQXAC9IVRw/default_live.jpg", "width": 120, "height": 0 }
+                ]
+            }),
+            &OptionValues::new(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            &live.items[0].source,
+            MediaSource::Direct { url, .. } if url.as_str() == thumbnail
+        ));
     }
 
     #[test]

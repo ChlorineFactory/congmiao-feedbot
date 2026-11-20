@@ -184,6 +184,18 @@ async fn run_once(app: &App, job: &QueuedJob, presence: &mut Presence) -> anyhow
         return Ok(());
     }
 
+    // Older photo file IDs can bypass the current preparation and upload limits.
+    let source_key = if extracted
+        .items
+        .iter()
+        .any(|item| item.kind == MediaKind::Photo)
+    {
+        let max_photo_bytes = prepare::telegram_photo_max_bytes(&app.pipeline.media);
+        let max_upload_bytes = app.pipeline.media.max_upload_bytes;
+        format!("{source_key}#telegram-photo-v3-{max_photo_bytes}-{max_upload_bytes}")
+    } else {
+        source_key
+    };
     let hits = app.store.get_cache_all(&source_key).await?;
     if total_items > 0 && hits.len() == total_items {
         info!("cache hit");
@@ -244,8 +256,8 @@ async fn run_once(app: &App, job: &QueuedJob, presence: &mut Presence) -> anyhow
         spoiler,
     )
     .await?;
-    // Only a complete set is cached, so a later hit never silently drops items.
-    if skipped.is_empty() {
+    // Cache complete sets only. A temporary preparation failure should be retried on the next request.
+    if skipped.is_empty() && prepared.iter().all(|item| item.cacheable) {
         let entries: Vec<MediaCacheEntry> = sent
             .iter()
             .filter_map(|(pos, msg)| cache_entry(&source_key, *pos, outgoing[*pos].kind, msg))
