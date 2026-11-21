@@ -115,6 +115,9 @@ pub(super) fn tweet_from_graphql(json: &Value) -> Result<Tweet, ExtractError> {
         .get("__typename")
         .and_then(Value::as_str)
         .unwrap_or("");
+    if matches!(typename, "TweetTombstone" | "Tombstone") {
+        return Err(ExtractError::Failed("推文不存在或已删除".into()));
+    }
     if typename == "TweetUnavailable" {
         let reason = result.get("reason").and_then(Value::as_str).unwrap_or("");
         return match reason {
@@ -126,17 +129,22 @@ pub(super) fn tweet_from_graphql(json: &Value) -> Result<Tweet, ExtractError> {
     }
     let legacy = result.get("legacy").unwrap_or(result);
     let user = result.pointer("/core/user_results/result/legacy");
-    let media_src = legacy
-        .pointer("/extended_entities/media")
-        .or_else(|| legacy.pointer("/entities/media"))
+    let extended_media = legacy.pointer("/extended_entities/media");
+    let entity_media = legacy.pointer("/entities/media");
+    let has_attachments = [extended_media, entity_media]
+        .into_iter()
+        .flatten()
+        .any(|media| !media.is_null() && media.as_array().is_none_or(|items| !items.is_empty()));
+    let media_src = extended_media
+        .or(entity_media)
         .cloned()
         .unwrap_or(Value::Array(Vec::new()));
     let details: Vec<MediaDetail> = serde_json::from_value(media_src).unwrap_or_default();
     Ok(Tweet {
-        text: legacy
-            .get("full_text")
-            .or_else(|| legacy.get("text"))
-            .and_then(Value::as_str)
+        text: json_str(result, "/note_tweet/note_tweet_results/result/text")
+            .filter(|text| !text.trim().is_empty())
+            .or_else(|| json_str(legacy, "/full_text"))
+            .or_else(|| json_str(legacy, "/text"))
             .map(str::to_string),
         name: user
             .and_then(|u| u.get("name"))
@@ -156,6 +164,7 @@ pub(super) fn tweet_from_graphql(json: &Value) -> Result<Tweet, ExtractError> {
             json_count(legacy.get("retweet_count")),
             json_count(legacy.get("reply_count")),
         ),
+        has_attachments,
         media: details.iter().filter_map(MediaDetail::to_raw).collect(),
     })
 }
@@ -227,6 +236,7 @@ impl RestTweet {
             screen_name: self.user.as_ref().and_then(|u| u.screen_name.clone()),
             nsfw: self.possibly_sensitive,
             engagement: None,
+            has_attachments: !media_src.is_empty(),
             media,
         }
     }

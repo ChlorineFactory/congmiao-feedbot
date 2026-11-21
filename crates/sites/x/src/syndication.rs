@@ -131,12 +131,14 @@ pub(super) struct SyndicationTweet {
 
 impl SyndicationTweet {
     pub(super) fn is_tombstone(&self) -> bool {
-        self.typename
-            .as_deref()
-            .is_some_and(|t| t.eq_ignore_ascii_case("Tombstone"))
+        self.typename.as_deref().is_some_and(|t| {
+            t.eq_ignore_ascii_case("Tombstone") || t.eq_ignore_ascii_case("TweetTombstone")
+        })
     }
 
     pub(super) fn into_tweet(self) -> Tweet {
+        let has_attachments =
+            !self.media_details.is_empty() || !self.photos.is_empty() || self.video.is_some();
         let mut media = Vec::new();
         for detail in &self.media_details {
             if let Some(item) = detail.to_raw() {
@@ -175,6 +177,7 @@ impl SyndicationTweet {
                 self.retweet_count,
                 self.conversation_count,
             ),
+            has_attachments,
             media,
         }
     }

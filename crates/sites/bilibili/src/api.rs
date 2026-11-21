@@ -10,7 +10,7 @@ use super::links::{av_digits, is_bvid, parse_target};
 use super::video::extracted_from_view;
 use super::wbi::{self, WbiKey};
 use super::{BilibiliExtractor, BilibiliTarget};
-use feedbot_core::extract::{ExtractCtx, ExtractError, Extracted, HttpRequest, MediaSource};
+use feedbot_core::extract::{ExtractCtx, ExtractError, Extracted, HttpRequest};
 use http::{HeaderMap, HeaderValue, header};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -247,7 +247,7 @@ impl BilibiliExtractor {
                 cookie,
             )
             .await?;
-        audio_from_api(sid, &song, &stream, &media_headers(cookie)?)
+        audio_from_api(sid, &song, &stream, media_headers(cookie)?, self.cdn)
     }
 
     pub(super) async fn extract_article(
@@ -418,18 +418,6 @@ impl BilibiliExtractor {
     }
 }
 
-pub(super) fn with_headers(source: MediaSource, headers: HeaderMap) -> MediaSource {
-    match source {
-        MediaSource::Direct { url, .. } => MediaSource::Direct { url, headers },
-        MediaSource::Separated { video, audio, .. } => MediaSource::Separated {
-            video,
-            audio,
-            headers,
-        },
-        other => other,
-    }
-}
-
 pub(super) fn media_headers(cookie: Option<&str>) -> Result<HeaderMap, ExtractError> {
     browser_headers(cookie)
 }
@@ -476,7 +464,7 @@ pub(super) fn build_url(
 
 #[cfg(test)]
 mod tests {
-    use crate::BilibiliExtractor;
+    use crate::{BilibiliCdn, BilibiliEndpoints, BilibiliExtractor};
     use feedbot_core::extract::{ExtractError, Extractor, MediaSource};
     use feedbot_core::options::OptionValues;
     use feedbot_site_common::testing::{FakeHttp, request};
@@ -507,7 +495,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn video_with_quality_and_login() {
+    async fn video_with_default_quality_backup_cdn_and_login() {
         let http = Arc::new(
             base()
                 .json("api.bilibili.com/x/web-interface/view", json!({ "code": 0, "data": {
@@ -517,15 +505,30 @@ mod tests {
                 .json("api.bilibili.com/x/player/playurl", json!({ "code": 0, "data": { "dash": {
                     "video": [
                         { "baseUrl": "https://upos.example/1080.m4s", "height": 1080, "codecid": 7 },
-                        { "baseUrl": "https://upos.example/720.m4s", "height": 720, "codecid": 7 }
+                        {
+                            "baseUrl": "https://upos.example/720.m4s",
+                            "backupUrl": ["https://upos.example/720.m4s", "invalid", "//mirror.example/720.m4s"],
+                            "backup_url": ["http://mirror.example/720.m4s", "https://mirror-two.example/720.m4s", "https://unused.example/720.m4s"],
+                            "height": 720,
+                            "codecid": 7
+                        }
                     ],
-                    "audio": [{ "baseUrl": "https://upos.example/a.m4s" }]
+                    "audio": [{
+                        "baseUrl": "invalid",
+                        "base_url": "https://upos.example/a.m4s",
+                        "backup_url": ["//mirror.example/a.m4s"]
+                    }]
                 } } })),
         );
-        let ext = extractor(&http);
-        let options = ext
-            .resolve_options(&OptionValues::new(), &["+q:720".into()])
-            .unwrap();
+        let ext = BilibiliExtractor::new(
+            BilibiliEndpoints {
+                cdn: BilibiliCdn::BackupUrl,
+                ..Default::default()
+            },
+            http.clone(),
+            None,
+        );
+        let options = ext.resolve_options(&OptionValues::new(), &[]).unwrap();
         let req = request(
             "bilibili",
             "https://www.bilibili.com/video/BV1xx411c7mD",
@@ -535,12 +538,39 @@ mod tests {
         let extracted = ext.extract(&http.ctx(), &req).await.unwrap();
 
         assert_eq!(extracted.title.as_deref(), Some("标题"));
-        let MediaSource::Separated { video, headers, .. } = &extracted.items[0].source else {
+        let MediaSource::Streams {
+            stream,
+            audio: Some(audio),
+            headers,
+        } = &extracted.items[0].source
+        else {
             panic!("{:?}", extracted.items[0].source);
         };
-        assert!(video.as_str().ends_with("720.m4s"));
-        assert!(headers.contains_key("cookie"));
+        assert_eq!(
+            stream
+                .urls
+                .iter()
+                .map(|url| url.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "https://mirror.example/720.m4s",
+                "https://mirror-two.example/720.m4s",
+                "https://upos.example/720.m4s",
+            ]
+        );
+        assert_eq!(
+            audio
+                .urls
+                .iter()
+                .map(|url| url.as_str())
+                .collect::<Vec<_>>(),
+            ["https://mirror.example/a.m4s", "https://upos.example/a.m4s"]
+        );
+        assert_eq!(headers[http::header::COOKIE], "SESSDATA=s");
+        assert_eq!(headers[http::header::REFERER], "https://www.bilibili.com/");
+        assert_eq!(headers[http::header::RANGE], "bytes=0-");
         let play = http.last("api.bilibili.com/x/player/playurl");
+        assert!(!play.headers.contains_key(http::header::RANGE));
         assert!(play.url.query().unwrap().contains("cid=5"));
         assert!(play.url.query().unwrap().contains("qn=64"));
         let cookie = play.headers["cookie"].to_str().unwrap();

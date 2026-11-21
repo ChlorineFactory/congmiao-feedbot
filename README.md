@@ -111,14 +111,16 @@ export FEEDBOT__TELEGRAPH__ACCESS_TOKEN=...
 
 ## Commands
 
-- `/help` / `/help pixiv` / `/help x` / `/help youtube` — command list and per-platform `+`/`-` option table (generated from extractor specs)
+- `/help` / `/help pixiv` / `/help x` / `/help youtube` — command list, login status, and per-platform `+`/`-` option table (generated from extractor specs). Group help shows global login status. Private help also shows your own login status
+- `/login` — choose a platform in a private chat
 - `/login pixiv` — private-chat login (PHPSESSID cookie)
 - `/login x` — private-chat login (`auth_token` / `ct0` cookie)
 - `/login youtube` — private-chat login (YouTube Cookie / Netscape cookies.txt). Aliases: `yt`, `ytb`, `ytbm`
 - `/login bili` — private-chat Bilibili QR login. Aliases: `bilibili`, `b站`
 - `/login netease` — private-chat NetEase Cloud Music QR login (needs sidecar). Aliases: `ncm`, `163`, `网易云`
-- `/login <platform> global` / `/logout <platform> global` — operators listed in `telegram.admin_ids` manage the shared fallback credential
-- `/logout <platform>` / `/accounts` — remove / list your own saved logins
+- `/accounts` — view global login status in groups and private chats. In private, it also shows your saved personal logins and offers buttons to log out
+- `/logout` — in a private chat, choose one of your saved personal logins to remove. Use `/logout <platform>` to remove it directly
+- `/login <platform> global` / `/logout <platform> global` — in a private chat, operators listed in `telegram.admin_ids` manage the shared fallback credential
 - `/set pixiv +q:original` — default options. In a private chat this sets your personal defaults; in a group it sets the group default (group admins only). Personal defaults win over group defaults; `-q` clears a value
 - `/sub <link> [+options]` — subscribe the current chat to a user page / channel / playlist. The first poll only records existing items; afterwards new items are pushed through the normal link pipeline with the given options. In groups only admins can `/sub` / `/unsub`
   - Subscribable: Pixiv user pages, YouTube channels / playlists, NetEase playlists / albums, Bilibili spaces (`space.bilibili.com/{uid}` for all dynamics, `/{uid}/video` for uploads only; video dynamics are pushed as the video), X profiles (`x.com/{user}` or `/{user}/media`: the user's own posts with media, no retweets; requires `/login x` by the subscriber first, and polls use that login)
@@ -126,7 +128,7 @@ export FEEDBOT__TELEGRAPH__ACCESS_TOKEN=...
 - `/cancel` — leave a pending login and cancel your queued or running jobs
 - Send a Pixiv, X, YouTube, Bilibili, or NetEase link to extract:
   - `https://www.pixiv.net/artworks/...`
-  - `https://x.com/{user}/status/{id}`
+  - `https://x.com/{user}/status/{id}` — media posts and text-only posts
   - `https://youtube.com/watch?v=...` / `https://youtu.be/{id}` — video (`+q:1080|720|480`)
   - `https://music.youtube.com/watch?v=...` — audio with cover
   - live streams send the cover image; ended VODs send video
@@ -139,6 +141,18 @@ In groups the bot only reacts to links it can handle. Each user may submit
 `limits.per_user_per_minute` links per minute.
 
 Age-gated or bot-walled YouTube URLs need `/login youtube`. Bilibili `-101` and NetEase login-gated APIs need the matching `/login`.
+
+## Bilibili downloads
+
+The bot requests 720p by default. Add `+q:1080` to a link for a higher limit or use `/set bilibili +q:1080` to save that preference. The streams Bilibili offers and the upload limit determine the delivered quality.
+
+Set `bilibili.cdn` in `config/default.toml` or `FEEDBOT__BILIBILI__CDN` in the environment. With Docker Compose, put the variable in `.env`.
+
+- `baseUrl` (default) tries the API's primary address first.
+- `backupUrl` tries the API's backup addresses first and keeps the primary address as a fallback.
+- A named mirror such as `ali`, `cos`, `hw`, `akamai`, or `hk_bcache` tries that CDN first. The bot prefers a matching address supplied by Bilibili and keeps the original address as a fallback.
+
+The setting applies to video and audio downloads. Each stream tries up to three addresses.
 
 ## NetEase sidecar
 

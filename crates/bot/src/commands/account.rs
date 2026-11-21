@@ -1,90 +1,42 @@
 //! `/logout` and `/accounts`.
 
+use feedbot_core::{CredentialStatus, Scope, StoreError, StoredCredentialMeta};
+use feedbot_extractors::ExtractorRegistry;
 use teloxide::prelude::*;
 use teloxide::types::InlineKeyboardMarkup;
 use teloxide::utils::html;
 
-use super::{unknown_platform, user_id};
+use super::{is_private, unknown_platform, user_id};
 use crate::app::App;
 use crate::ui::{self, UiCallback};
-use feedbot_core::{CredentialStatus, Scope};
 
 pub(super) async fn logout_usage(
     bot: &crate::app::TgBot,
     msg: &Message,
     app: &App,
 ) -> anyhow::Result<()> {
-    let logged = app
-        .store
-        .list_for_user(user_id(msg))
-        .await
-        .unwrap_or_default();
-    let (body, kb) = if logged.is_empty() {
-        let logins: Vec<_> = app
-            .registry
-            .all()
-            .iter()
-            .filter(|e| e.auth().is_some())
-            .collect();
-        let platforms = if logins.is_empty() {
-            "当前没有需要登录的平台。".into()
-        } else {
-            ui::join_blocks(
-                &logins
-                    .iter()
-                    .map(|ext| ui::platform_block(ext.as_ref()))
-                    .collect::<Vec<_>>(),
-            )
-        };
-        let plats = ui::named_platforms(app.registry.all(), true);
-        (platforms, ui::platform_keyboard(UiCallback::Logout, &plats))
-    } else {
-        let mut owned = Vec::new();
-        let mut lines = Vec::new();
-        for meta in &logged {
-            let label = app
-                .registry
-                .by_id(&meta.extractor_id)
-                .map(|e| e.display_name().to_string())
-                .unwrap_or_else(|| meta.extractor_id.clone());
-            lines.push(format!(
-                "<code>{}</code>  {}\n{}/{}",
-                html::escape(&meta.extractor_id),
-                html::escape(&label),
-                meta.scope.as_str(),
-                meta.method
-            ));
-            owned.push((meta.extractor_id.clone(), label));
-        }
-        let refs: Vec<_> = owned
-            .iter()
-            .map(|(id, label)| (id.as_str(), label.as_str()))
-            .collect();
-        (
-            ui::join_blocks(&lines),
-            ui::platform_keyboard(UiCallback::Logout, &refs),
-        )
-    };
-    let heading = if logged.is_empty() {
-        "可注销平台"
-    } else {
-        "已登录"
-    };
-    ui::send_page(
-        bot,
-        msg.chat.id,
-        ui::compose(
-            "注销",
-            None,
-            &[
-                ui::section("用法", &format!("/logout {}", ui::placeholder("<平台>"))),
-                ui::section(heading, &body),
-            ],
-        ),
-        kb,
-    )
-    .await?;
-    Ok(())
+    let list = app.store.list_for_user(user_id(msg)).await?;
+    let (text, kb) = logout_page(&app.registry, &list);
+    ui::send_page(bot, msg.chat.id, text, kb).await
+}
+
+fn logout_page(
+    registry: &ExtractorRegistry,
+    list: &[StoredCredentialMeta],
+) -> (String, Option<InlineKeyboardMarkup>) {
+    let personal: Vec<_> = list
+        .iter()
+        .filter(|meta| meta.scope == Scope::User)
+        .collect();
+    let text = ui::compose(
+        "退出登录",
+        None,
+        &[
+            ui::section("用法", &format!("/logout {}", ui::placeholder("<平台>"))),
+            credential_section(registry, "个人登录", &personal),
+        ],
+    );
+    (text, logout_keyboard(registry, &personal))
 }
 
 /// Delete the credential stored at `(scope, scope_id)` for platform `name`.
@@ -100,21 +52,28 @@ pub(crate) async fn logout_html(
         .store
         .delete_credential(ext.id(), scope, scope_id)
         .await?;
-    let text = if ok {
-        ui::compose(
-            "已注销",
-            Some(ext.display_name()),
-            &[ui::section("下一步", "/login 重新登录，或 /help 查看命令")],
+    let scope_label = if scope == Scope::Global {
+        "共享"
+    } else {
+        "个人"
+    };
+    let (heading, lead) = if ok {
+        (
+            "已退出登录",
+            format!("{} 的{scope_label}凭据已移除。", ext.display_name()),
         )
     } else {
-        ui::compose(
+        (
             "未找到凭据",
-            Some("没有找到对应凭据。"),
-            &[ui::section("下一步", "/login 登录后再试")],
+            format!("{} 没有保存{scope_label}凭据。", ext.display_name()),
         )
     };
     Ok((
-        text,
+        ui::compose(
+            heading,
+            Some(&lead),
+            &[ui::section("下一步", "/accounts 查看登录状态")],
+        ),
         Some(ui::help_platform_keyboard(ext.id(), ext.auth().is_some())),
     ))
 }
@@ -124,59 +83,181 @@ pub(super) async fn accounts(
     msg: &Message,
     app: &App,
 ) -> anyhow::Result<()> {
-    let Some(user) = msg.from.clone() else {
-        return Ok(());
-    };
-    let list = app.store.list_for_user(user.id.0 as i64).await?;
-    if list.is_empty() {
-        let plats = ui::named_platforms(app.registry.all(), true);
-        ui::send_page(
-            bot,
-            msg.chat.id,
-            ui::compose(
-                "凭据",
-                Some("还没有保存的凭据。"),
-                &[ui::section(
-                    "下一步",
-                    &format!("私聊 /login {}", ui::placeholder("<平台>")),
-                )],
-            ),
-            ui::platform_keyboard(UiCallback::Login, &plats),
-        )
-        .await?;
-        return Ok(());
+    let viewer = is_private(msg).then(|| user_id(msg));
+    let list = visible_credentials(app, viewer).await?;
+    let (text, kb) = accounts_page(&app.registry, &list, viewer.is_some());
+    ui::send_page(bot, msg.chat.id, text, kb).await
+}
+
+pub(super) async fn visible_credentials(
+    app: &App,
+    viewer: Option<i64>,
+) -> Result<Vec<StoredCredentialMeta>, StoreError> {
+    match viewer {
+        Some(user_id) => app.store.list_for_user(user_id).await,
+        None => app.store.list_global().await,
     }
-    let body = list
+}
+
+fn accounts_page(
+    registry: &ExtractorRegistry,
+    list: &[StoredCredentialMeta],
+    private: bool,
+) -> (String, Option<InlineKeyboardMarkup>) {
+    let shared: Vec<_> = list
+        .iter()
+        .filter(|meta| meta.scope == Scope::Global)
+        .collect();
+    if !private {
+        return (
+            ui::compose(
+                "登录状态",
+                Some("私聊发送 /accounts 查看个人登录。"),
+                &[credential_section(registry, "全局登录", &shared)],
+            ),
+            None,
+        );
+    }
+    let personal: Vec<_> = list
+        .iter()
+        .filter(|meta| meta.scope == Scope::User)
+        .collect();
+    let mut sections = vec![credential_section(registry, "个人登录", &personal)];
+    if !shared.is_empty() {
+        sections.push(credential_section(registry, "全局登录", &shared));
+    }
+    let kb = if personal.is_empty() {
+        let platforms = ui::named_platforms(registry.all(), true);
+        ui::platform_keyboard(UiCallback::Login, &platforms)
+    } else {
+        logout_keyboard(registry, &personal)
+    };
+    (ui::compose("登录状态", None, &sections), kb)
+}
+
+pub(super) fn platform_login_hint(
+    credentials: &[StoredCredentialMeta],
+    platform_id: &str,
+    private: bool,
+) -> String {
+    let status = |scope| {
+        credentials
+            .iter()
+            .find(|meta| meta.scope == scope && meta.extractor_id == platform_id)
+            .map_or("未配置", |meta| status_label(meta.status))
+    };
+    let global = status(Scope::Global);
+    if private {
+        format!("个人登录（{}） · 全局登录（{global}）", status(Scope::User))
+    } else {
+        format!("全局登录（{global}）")
+    }
+}
+
+fn credential_section(
+    registry: &ExtractorRegistry,
+    heading: &str,
+    entries: &[&StoredCredentialMeta],
+) -> String {
+    if entries.is_empty() {
+        return ui::section(heading, "没有保存的登录。");
+    }
+    let blocks: Vec<_> = entries
         .iter()
         .map(|meta| {
+            let id = ui::placeholder(&meta.extractor_id);
+            let platform = match registry.by_id(&meta.extractor_id) {
+                Some(ext) => format!("{} ({id})", html::escape(ext.display_name())),
+                None => id,
+            };
             format!(
-                "<code>{}</code>  {}/{}\n{}",
-                html::escape(&meta.extractor_id),
-                meta.scope.as_str(),
+                "{platform} · {} · {}",
                 meta.method,
                 status_label(meta.status)
             )
         })
-        .collect::<Vec<_>>();
-    ui::send_page(
-        bot,
-        msg.chat.id,
-        ui::compose(
-            "凭据",
-            None,
-            &[ui::section("已保存", &ui::join_blocks(&body))],
-        ),
-        None,
-    )
-    .await?;
-    Ok(())
+        .collect();
+    ui::section(heading, &ui::join_blocks(&blocks))
+}
+
+fn logout_keyboard(
+    registry: &ExtractorRegistry,
+    personal: &[&StoredCredentialMeta],
+) -> Option<InlineKeyboardMarkup> {
+    if personal.is_empty() {
+        return None;
+    }
+    let rows = personal
+        .iter()
+        .map(|meta| {
+            let ext = registry.by_id(&meta.extractor_id);
+            let name = ext
+                .as_ref()
+                .map_or(meta.extractor_id.as_str(), |e| e.display_name());
+            vec![(
+                format!("退出 {name}"),
+                UiCallback::Logout(meta.extractor_id.clone()),
+            )]
+        })
+        .collect();
+    Some(ui::keyboard(rows))
 }
 
 fn status_label(status: CredentialStatus) -> &'static str {
     match status {
         CredentialStatus::Valid => "有效",
-        CredentialStatus::Expired => "已过期，请重新 /login",
-        CredentialStatus::Invalid => "已失效，请重新 /login",
+        CredentialStatus::Expired => "已过期",
+        CredentialStatus::Invalid => "已失效",
         CredentialStatus::Unknown => "状态未知",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use feedbot_core::AuthMethod;
+
+    #[test]
+    fn account_pages_show_status_and_offer_logout_only_for_personal_credentials() {
+        let registry = ExtractorRegistry::builtin();
+        let entries = [
+            ("x", Scope::User, CredentialStatus::Expired, 10),
+            ("x", Scope::Global, CredentialStatus::Valid, 0),
+            ("pixiv", Scope::Global, CredentialStatus::Unknown, 0),
+        ]
+        .map(|(id, scope, status, scope_id)| StoredCredentialMeta {
+            extractor_id: id.into(),
+            scope,
+            scope_id,
+            method: AuthMethod::Cookie,
+            expires_at: None,
+            status,
+        });
+        let expected_keyboard = Some(ui::keyboard(vec![vec![(
+            "退出 X".into(),
+            UiCallback::Logout("x".into()),
+        )]]));
+
+        let (accounts, keyboard) = accounts_page(&registry, &entries, true);
+        let (personal, shared) = accounts.split_once("全局登录").unwrap();
+        assert!(personal.contains("个人登录"));
+        assert!(personal.contains("已过期"));
+        assert!(shared.contains("有效"));
+        assert!(shared.contains("状态未知"));
+        assert_eq!(keyboard, expected_keyboard);
+
+        let (group_accounts, keyboard) = accounts_page(&registry, &entries, false);
+        assert!(group_accounts.contains("全局登录"));
+        assert!(group_accounts.contains("状态未知"));
+        assert!(!group_accounts.contains("已过期"));
+        assert!(keyboard.is_none());
+        let (unconfigured, _) = accounts_page(&registry, &entries[..1], false);
+        assert!(unconfigured.contains("没有保存的登录"));
+
+        let (logout, keyboard) = logout_page(&registry, &entries);
+        assert!(logout.contains("已过期"));
+        assert!(!logout.contains("pixiv"));
+        assert_eq!(keyboard, expected_keyboard);
+        assert!(logout_page(&registry, &entries[1..]).1.is_none());
     }
 }

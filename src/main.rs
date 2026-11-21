@@ -57,6 +57,7 @@ async fn main() -> anyhow::Result<()> {
             passport_base: cfg.bilibili.passport_base.clone(),
             api_base: cfg.bilibili.api_base.clone(),
             live_api_base: cfg.bilibili.live_api_base.clone(),
+            cdn: cfg.bilibili.cdn,
         },
         netease: NeteaseEndpoints {
             api_base: cfg.netease.api_base.clone(),

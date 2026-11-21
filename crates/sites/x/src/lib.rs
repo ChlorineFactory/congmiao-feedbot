@@ -105,7 +105,7 @@ const META: SiteMeta = SiteMeta {
     name: "X",
     aliases: &["twitter", "tw"],
     priority: 70,
-    kinds: &["图片", "视频", "动图 GIF"],
+    kinds: &["纯文本", "图片", "视频", "动图 GIF"],
     examples: &["/status/{id}", "/{user}/status/{id}", "/i/web/status/{id}"],
     feed_examples: &["x.com/{user}", "x.com/{user}/media"],
 };
@@ -183,9 +183,9 @@ impl Extractor for XExtractor {
             fetch_syndication(ctx, id).await?
         };
 
-        let items = media_items(&tweet, id, orig);
-        let items = select_pages(items, page_range);
-        if items.is_empty() {
+        let text = tweet.text.as_deref().map(str::trim).unwrap_or("");
+        let items = select_pages(media_items(&tweet, id, orig), page_range);
+        if items.is_empty() && (tweet.has_attachments || text.is_empty()) {
             return Err(ExtractError::Failed("没有可发送的媒体".into()));
         }
 
@@ -198,7 +198,6 @@ impl Extractor for XExtractor {
             .filter(|s| !s.is_empty())
             .or_else(|| screen.map(|s| format!("@{s}")));
         let author_url = screen.and_then(|s| Url::parse(&format!("https://x.com/{s}")).ok());
-        let text = tweet.text.as_deref().map(str::trim).unwrap_or("");
         let title = title_from_text(text);
         let description = if text.is_empty() {
             None
@@ -246,6 +245,7 @@ struct Tweet {
     screen_name: Option<String>,
     nsfw: bool,
     engagement: Option<Engagement>,
+    has_attachments: bool,
     media: Vec<RawMedia>,
 }
 
@@ -661,6 +661,55 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn text_only_posts_preserve_metadata() {
+            let text = "First line\nSecond line";
+            let public = json!({
+                "text": text,
+                "user": { "name": "A", "screen_name": "a" },
+                "favorite_count": 3,
+                "quoted_tweet": syndication(),
+            });
+            let mut authenticated = graphql();
+            let result = authenticated
+                .pointer_mut("/data/tweetResult/result")
+                .unwrap();
+            result["legacy"] = json!({ "full_text": "First line", "favorite_count": 3 });
+            result["note_tweet"] = json!({ "note_tweet_results": { "result": { "text": text } } });
+
+            for (route, body, cookie) in [
+                (SYNDICATION.to_string(), public, None),
+                (graphql_route(), authenticated, Some(COOKIE)),
+            ] {
+                let http = Arc::new(FakeHttp::new().json(&route, body));
+                let ext = XExtractor::new(http.clone(), Default::default());
+                let req = request("x", URL, options(&ext, &[]), cookie);
+                let extracted = ext.extract(&http.ctx(), &req).await.unwrap();
+                assert_eq!(extracted.title.as_deref(), Some("First line"));
+                assert_eq!(extracted.author.as_deref(), Some("A"));
+                assert_eq!(extracted.description.as_deref(), Some(text));
+                assert_eq!(extracted.engagement.unwrap().likes, Some(3));
+                assert!(extracted.items.is_empty());
+                assert_eq!(http.urls().len(), 1);
+            }
+        }
+
+        #[tokio::test]
+        async fn empty_tombstone_and_unsupported_media_are_not_text_posts() {
+            for body in [
+                json!({}),
+                json!({ "text": " \n " }),
+                json!({ "__typename": "TweetTombstone", "text": "Not available" }),
+                json!({ "text": "Has media", "mediaDetails": [{ "type": "unsupported" }] }),
+            ] {
+                let http = Arc::new(FakeHttp::new().json(SYNDICATION, body));
+                let ext = XExtractor::new(http.clone(), Default::default());
+                let req = request("x", URL, options(&ext, &[]), None);
+                let err = ext.extract(&http.ctx(), &req).await.unwrap_err();
+                assert!(matches!(err, ExtractError::Failed(_)), "{err:?}");
+            }
+        }
+
+        #[tokio::test]
         async fn logged_in_uses_graphql_with_page_range() {
             let http = Arc::new(FakeHttp::new().json(&graphql_route(), graphql()));
             let ext = XExtractor::new(http.clone(), Default::default());
@@ -671,6 +720,10 @@ mod tests {
             let sent = http.last(&graphql_route());
             assert_eq!(sent.headers["x-csrf-token"], "bbbbbbbbbb");
             assert_eq!(http.urls().len(), 1);
+
+            let req = request("x", URL, options(&ext, &["+p:3"]), Some(COOKIE));
+            let err = ext.extract(&http.ctx(), &req).await.unwrap_err();
+            assert!(matches!(err, ExtractError::Failed(_)), "{err:?}");
         }
 
         #[tokio::test]

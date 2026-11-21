@@ -1,5 +1,6 @@
 use feedbot_bot::TelegraphSettings;
-use serde::Deserialize;
+use feedbot_extractors::BilibiliCdn;
+use serde::{Deserialize, Deserializer};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::net::SocketAddr;
@@ -156,6 +157,15 @@ pub struct BilibiliConfig {
     pub passport_base: String,
     pub api_base: String,
     pub live_api_base: String,
+    #[serde(deserialize_with = "deserialize_bilibili_cdn")]
+    pub cdn: BilibiliCdn,
+}
+
+fn deserialize_bilibili_cdn<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BilibiliCdn, D::Error> {
+    let value = String::deserialize(deserializer)?;
+    value.parse().map_err(serde::de::Error::custom)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -399,6 +409,26 @@ mod tests {
         assert_eq!(cfg.telegram.mode, TelegramMode::Polling);
         assert_eq!(cfg.output.overflow, OverflowMode::Chunk);
         assert!(cfg.telegraph.access_token.is_empty());
+        assert_eq!(cfg.bilibili.cdn, BilibiliCdn::BaseUrl);
+    }
+
+    #[test]
+    fn config_parses_bilibili_cdn_override() {
+        let cfg: AppConfig = config::Config::builder()
+            .add_source(config::File::with_name("config/default").required(true))
+            .add_source(
+                config::Environment::with_prefix("FEEDBOT")
+                    .separator("__")
+                    .try_parsing(true)
+                    .source(Some(
+                        [("FEEDBOT__BILIBILI__CDN".into(), "backupUrl".into())].into(),
+                    )),
+            )
+            .build()
+            .unwrap()
+            .try_deserialize()
+            .unwrap();
+        assert_eq!(cfg.bilibili.cdn, BilibiliCdn::BackupUrl);
     }
 
     fn defaults() -> AppConfig {

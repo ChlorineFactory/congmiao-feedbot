@@ -1,9 +1,12 @@
 //! Post layout (X).
 
 use super::{build_caption, build_caption_page};
-use feedbot_core::CaptionPage;
-use feedbot_core::{Engagement, Extracted, MediaItem, MediaKind, MediaSource};
+use crate::caption::{TEXT_LIMIT, build_text_message, take_utf16};
+use feedbot_core::{
+    CaptionPage, Engagement, Extracted, MediaItem, MediaKind, MediaSource, Present,
+};
 use http::HeaderMap;
+use teloxide::utils::html;
 use url::Url;
 
 fn sample(
@@ -69,6 +72,17 @@ fn caption_is_stats_plus_expandable_without_title_or_author_links() {
     assert!(!rendered.caption.contains(" / bob"));
     assert!(!rendered.caption.contains("ignored title"));
     assert!(rendered.extras.is_empty());
+}
+
+#[test]
+fn text_only_post_keeps_the_body_visible_and_splits_at_the_message_limit() {
+    let body = format!("<&>\n{}", "😀".repeat(TEXT_LIMIT / 2 + 1));
+    let extracted = sample(Some(&body), false, 0, None, true);
+    let rendered = build_text_message(Present::Post { origin: "原帖" }, &extracted);
+    let (first, rest) = take_utf16(&body, TEXT_LIMIT);
+
+    assert_eq!(rendered.caption, html::escape(first));
+    assert_eq!(rendered.extras, [html::escape(rest)]);
 }
 
 #[test]

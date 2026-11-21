@@ -5,7 +5,7 @@ pub mod http;
 pub mod normalize;
 pub mod registry;
 
-pub use feedbot_bilibili::BilibiliEndpoints;
+pub use feedbot_bilibili::{BilibiliCdn, BilibiliEndpoints};
 pub use feedbot_netease::NeteaseEndpoints;
 pub use feedbot_x::XQueryIds;
 pub use http::ReqwestClient;

@@ -9,7 +9,7 @@ mod sub;
 use feedbot_extractors::ExtractorRegistry;
 use std::sync::Arc;
 use teloxide::prelude::*;
-use teloxide::types::{BotCommand, BotCommandScope, ChatKind};
+use teloxide::types::{BotCommand, BotCommandScope, ChatKind, InlineKeyboardMarkup};
 use teloxide::utils::command::{BotCommands, ParseError};
 
 use crate::app::App;
@@ -33,9 +33,9 @@ pub enum Command {
     Help(String),
     #[command(description = "登录平台账号（仅私聊）")]
     Login(String),
-    #[command(description = "注销平台账号")]
+    #[command(description = "注销平台账号（仅私聊）")]
     Logout(String),
-    #[command(description = "查看已登录的平台与凭据状态")]
+    #[command(description = "查看平台登录状态（群聊显示全局登录）")]
     Accounts,
     #[command(description = "查看或修改平台默认参数")]
     Set(String),
@@ -60,7 +60,7 @@ impl Command {
     pub fn group_commands() -> Vec<BotCommand> {
         Self::bot_commands()
             .into_iter()
-            .filter(|c| !matches!(c.command.as_str(), "login" | "logout" | "accounts"))
+            .filter(|c| !matches!(c.command.as_str(), "login" | "logout"))
             .collect()
     }
 }
@@ -88,18 +88,9 @@ pub async fn handle(
         Command::Start => {
             ui::send_page(&bot, msg.chat.id, about_bot(), None).await?;
         }
-        Command::Help(name) if name.trim().is_empty() => {
-            let plats = ui::named_platforms(app.registry.all(), false);
-            ui::send_page(
-                &bot,
-                msg.chat.id,
-                help_overview(&app.registry),
-                ui::platform_keyboard(UiCallback::HelpPlatform, &plats),
-            )
-            .await?;
-        }
         Command::Help(name) => {
-            let (text, kb) = help_platform_page(&app.registry, &name);
+            let viewer = is_private(&msg).then(|| user_id(&msg));
+            let (text, kb) = help_page(&app, &name, viewer).await;
             ui::send_page(&bot, msg.chat.id, text, kb).await?;
         }
         Command::Login(name) if name.trim().is_empty() => {
@@ -119,6 +110,9 @@ pub async fn handle(
         Command::Login(args) => {
             let (name, global) = login::parse_target(&args);
             login::begin(&bot, &msg, app, dialogue, name, global).await?;
+        }
+        Command::Logout(_) if !is_private(&msg) => {
+            ui::send_page(&bot, msg.chat.id, "请私聊使用 /logout", None).await?;
         }
         Command::Logout(args) if args.trim().is_empty() => {
             logout_usage(&bot, &msg, &app).await?;
@@ -162,6 +156,36 @@ pub async fn handle(
         }
     }
     Ok(())
+}
+
+pub(crate) async fn help_page(
+    app: &App,
+    name: &str,
+    viewer: Option<i64>,
+) -> (String, Option<InlineKeyboardMarkup>) {
+    let credentials = account::visible_credentials(app, viewer).await;
+    let private = viewer.is_some();
+    let (mut text, kb) = if name.trim().is_empty() {
+        let platforms = ui::named_platforms(app.registry.all(), false);
+        let text = match &credentials {
+            Ok(list) => help::help_overview_with_accounts(&app.registry, list, private),
+            Err(_) => help_overview(&app.registry),
+        };
+        (
+            text,
+            ui::platform_keyboard(UiCallback::HelpPlatform, &platforms),
+        )
+    } else {
+        match &credentials {
+            Ok(list) => help::help_platform_page_with_accounts(&app.registry, name, list, private),
+            Err(_) => help_platform_page(&app.registry, name),
+        }
+    };
+    if let Err(error) = credentials {
+        tracing::warn!(%error, "could not load login status for help");
+        text.push_str(&ui::section("登录状态", "暂时无法读取。"));
+    }
+    (text, kb)
 }
 
 pub fn about_bot() -> String {

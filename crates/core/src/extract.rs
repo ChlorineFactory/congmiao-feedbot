@@ -8,7 +8,7 @@ use http::HeaderMap;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use thiserror::Error;
-use url::Url;
+use url::{Origin, Url};
 
 #[derive(Debug, Clone)]
 pub struct RequesterInfo {
@@ -104,9 +104,9 @@ pub enum MediaSource {
         url: Url,
         headers: HeaderMap,
     },
-    Separated {
-        video: Url,
-        audio: Url,
+    Streams {
+        stream: DownloadSource,
+        audio: Option<DownloadSource>,
         headers: HeaderMap,
     },
     UgoiraZip {
@@ -121,6 +121,14 @@ pub enum MediaSource {
         thumbnail: Option<Url>,
         cookies: Option<String>,
     },
+}
+
+/// Candidate URLs for the same file, in download order.
+#[derive(Debug, Clone)]
+pub struct DownloadSource {
+    pub urls: Vec<Url>,
+    /// Original media origin allowed to receive credentials.
+    pub credential_origin: Origin,
 }
 
 /// One item of a subscribable source.

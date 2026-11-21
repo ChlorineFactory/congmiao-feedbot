@@ -180,6 +180,21 @@ impl SqliteStore {
         })
     }
 
+    async fn list_credential_meta(
+        &self,
+        user_id: Option<i64>,
+    ) -> Result<Vec<StoredCredentialMeta>, StoreError> {
+        let rows = sqlx::query(
+            "SELECT extractor_id, scope, scope_id, method, expires_at, status FROM credentials
+             WHERE scope = 'global' OR (scope = 'user' AND scope_id = ?)",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
+        .db()?;
+        rows.iter().map(Self::meta_from_row).collect()
+    }
+
     fn meta_from_row(row: &SqliteRow) -> Result<StoredCredentialMeta, StoreError> {
         let expires: Option<String> = col(row, "expires_at")?;
         Ok(StoredCredentialMeta {
@@ -657,15 +672,11 @@ impl CredentialRepo for SqliteStore {
     }
 
     async fn list_for_user(&self, user_id: i64) -> Result<Vec<StoredCredentialMeta>, StoreError> {
-        let rows = sqlx::query(
-            "SELECT extractor_id, scope, scope_id, method, expires_at, status FROM credentials
-             WHERE (scope = 'user' AND scope_id = ?) OR scope = 'global'",
-        )
-        .bind(user_id)
-        .fetch_all(&self.pool)
-        .await
-        .db()?;
-        rows.iter().map(Self::meta_from_row).collect()
+        self.list_credential_meta(Some(user_id)).await
+    }
+
+    async fn list_global(&self) -> Result<Vec<StoredCredentialMeta>, StoreError> {
+        self.list_credential_meta(None).await
     }
 
     async fn due_for_check(
@@ -808,10 +819,25 @@ mod tests {
         assert!(s.resolve("pixiv", 7).await.unwrap().is_none());
         s.save(Scope::Global, 0, &cred("global")).await.unwrap();
         s.save(Scope::User, 7, &cred("mine")).await.unwrap();
+        s.save(Scope::User, 0, &cred("other")).await.unwrap();
         let mine = s.resolve("pixiv", 7).await.unwrap().unwrap();
         assert_eq!(mine.payload, b"mine");
         let fallback = s.resolve("pixiv", 8).await.unwrap().unwrap();
         assert_eq!(fallback.payload, b"global");
+
+        let shared = s.list_global().await.unwrap();
+        assert_eq!(shared.len(), 1);
+        assert_eq!(shared[0].scope, Scope::Global);
+        assert_eq!(shared[0].extractor_id, "pixiv");
+
+        let visible = s.list_for_user(7).await.unwrap();
+        assert_eq!(visible.len(), 2);
+        assert!(visible.iter().any(|meta| meta.scope == Scope::Global));
+        assert!(
+            visible
+                .iter()
+                .any(|meta| meta.scope == Scope::User && meta.scope_id == 7)
+        );
     }
 
     #[tokio::test]

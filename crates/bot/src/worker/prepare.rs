@@ -103,20 +103,28 @@ async fn prepare_one(
             downloader.to_file(&url, &headers, &path).await?;
             (path, item.filename, item.kind)
         }
-        MediaSource::Separated {
-            video,
+        MediaSource::Streams {
+            stream,
             audio,
             headers,
         } => {
-            let vpath = dir.join(format!("{idx}_v.bin"));
-            let apath = dir.join(format!("{idx}_a.bin"));
-            let out = dir.join(format!("{idx}_out.mp4"));
-            tokio::try_join!(
-                downloader.to_file(&video, &headers, &vpath),
-                downloader.to_file(&audio, &headers, &apath),
-            )?;
-            media.remux(&[vpath, apath], &out).await?;
-            (out, Some("video.mp4".into()), MediaKind::Video)
+            if let Some(audio) = audio {
+                let vpath = dir.join(format!("{idx}_v.bin"));
+                let apath = dir.join(format!("{idx}_a.bin"));
+                let out = dir.join(format!("{idx}_out.mp4"));
+                tokio::try_join!(
+                    downloader.to_file_with_fallback(&stream, &headers, &vpath),
+                    downloader.to_file_with_fallback(&audio, &headers, &apath),
+                )?;
+                media.remux(&[vpath, apath], &out).await?;
+                (out, Some("video.mp4".into()), MediaKind::Video)
+            } else {
+                let path = dir.join(safe_name(item.filename.as_deref(), idx));
+                downloader
+                    .to_file_with_fallback(&stream, &headers, &path)
+                    .await?;
+                (path, item.filename, item.kind)
+            }
         }
         MediaSource::UgoiraZip {
             zip,

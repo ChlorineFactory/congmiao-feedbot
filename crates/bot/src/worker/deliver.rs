@@ -58,6 +58,16 @@ impl Post<'_> {
     }
 }
 
+pub(super) async fn send_text_post(target: &Target<'_>, post: Post<'_>) -> anyhow::Result<()> {
+    let rendered = caption::build_text_message(post.present, post.extracted);
+    let mut request = target.message(&rendered.caption);
+    if let Some(markup) = caption::media_keyboard(post.present, post.extracted) {
+        request = request.reply_markup(markup);
+    }
+    request.await?;
+    send_extras(target, &rendered).await
+}
+
 /// Caption overflow, text-only fallback, and the summary / skipped notice.
 pub(super) async fn finish_delivery(
     app: &App,
@@ -182,18 +192,7 @@ pub(super) async fn deliver(
                 sent.push((i, msg));
             }
             SendPlan::Album(idxs) => {
-                // Every album entry carries its own caption, so opening any
-                // photo shows its `n/total` position.
-                let media: Vec<InputMedia> = idxs
-                    .iter()
-                    .map(|&i| {
-                        input_media(
-                            &items[i],
-                            caption_for_index(post, i, total).as_deref(),
-                            spoiler,
-                        )
-                    })
-                    .collect();
+                let media = album_media(post, items, &idxs, spoiler);
                 let mut req = target.bot.send_media_group(target.chat, media);
                 if let Some(rp) = &target.reply {
                     req = req.reply_parameters(rp.clone());
@@ -204,6 +203,28 @@ pub(super) async fn deliver(
         }
     }
     Ok((group_count, sent))
+}
+
+fn album_media(
+    post: Post<'_>,
+    items: &[Outgoing],
+    idxs: &[usize],
+    spoiler: bool,
+) -> Vec<InputMedia> {
+    idxs.iter()
+        .enumerate()
+        .map(|(position, &index)| {
+            let item = &items[index];
+            // Telegram displays an album caption when only one photo or video carries it.
+            let shared_caption = album::GroupClass::of(item.kind) == album::GroupClass::PhotoVideo;
+            let caption = if position == 0 || !shared_caption {
+                caption_for_index(post, index, items.len())
+            } else {
+                None
+            };
+            input_media(item, caption.as_deref(), spoiler)
+        })
+        .collect()
 }
 
 /// Caption, reply target and keyboard setters shared by every `send_*` request.
@@ -349,3 +370,6 @@ pub(super) fn cache_entry(
         size: i64::from(file.size),
     })
 }
+
+#[cfg(test)]
+mod tests;

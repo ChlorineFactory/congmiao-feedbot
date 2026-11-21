@@ -7,6 +7,7 @@
 
 mod api;
 mod auth;
+mod cdn;
 mod content;
 mod dynamic;
 mod feed;
@@ -15,6 +16,7 @@ mod video;
 mod wbi;
 
 use auth::{BilibiliAuth, cookie_from_req};
+pub use cdn::BilibiliCdn;
 use feed::parse_space;
 use links::{expand_if_short, is_bilibili_host, is_short_bili_host, parse_target, rewrite};
 
@@ -38,7 +40,7 @@ const SPEC: OptionSpec = OptionSpec {
             kind: OptionKind::Enum {
                 variants: &["1080", "720", "480"],
             },
-            default: Some(OptionDefault::Enum("1080")),
+            default: Some(OptionDefault::Enum("720")),
             affects_output: true,
             desc: "视频最高高度",
         },
@@ -58,6 +60,7 @@ pub struct BilibiliEndpoints {
     pub passport_base: String,
     pub api_base: String,
     pub live_api_base: String,
+    pub cdn: BilibiliCdn,
 }
 
 impl Default for BilibiliEndpoints {
@@ -66,6 +69,7 @@ impl Default for BilibiliEndpoints {
             passport_base: "https://passport.bilibili.com".into(),
             api_base: "https://api.bilibili.com".into(),
             live_api_base: "https://api.live.bilibili.com".into(),
+            cdn: BilibiliCdn::default(),
         }
     }
 }
@@ -85,6 +89,7 @@ pub struct BilibiliExtractor {
     api_base: String,
     live_api_base: String,
     www_base: String,
+    cdn: BilibiliCdn,
     device_cookie: Mutex<Option<String>>,
     wbi_key: Mutex<Option<wbi::WbiKey>>,
     /// Largest file the bot can send; video quality is picked to fit it.
@@ -103,6 +108,7 @@ impl BilibiliExtractor {
             api_base: trim_slash(&endpoints.api_base),
             live_api_base: trim_slash(&endpoints.live_api_base),
             www_base: "https://www.bilibili.com".into(),
+            cdn: endpoints.cdn,
             device_cookie: Mutex::new(None),
             wbi_key: Mutex::new(None),
             max_upload_bytes,
@@ -195,7 +201,7 @@ mod tests {
     use super::auth::{BiliPoll, bili_poll_code, cookies_from_set_cookie, merge_cookies};
     use super::dynamic::dynamic_from_item;
     use super::links::parse_target;
-    use super::video::{quality_height, video_from_view_play};
+    use super::video::{play_source, quality_height, video_from_view_play};
     use super::*;
     use feedbot_core::extract::{MediaKind, MediaSource};
     use feedbot_core::options::{OptionValues, merge_layers};
@@ -270,7 +276,7 @@ mod tests {
     }
 
     #[test]
-    fn video_fixture_is_separated() {
+    fn video_fixture_has_separate_tracks() {
         let view = serde_json::json!({
             "bvid": "BV1xx411c7mD",
             "cid": 1,
@@ -291,15 +297,38 @@ mod tests {
                 "audio": [{ "baseUrl": "https://upos.example/a.m4s" }]
             }
         });
-        let extracted =
-            video_from_view_play("BV1xx411c7mD", &view, &play, 1080, None, None).unwrap();
+        let extracted = video_from_view_play(
+            "BV1xx411c7mD",
+            &view,
+            &play,
+            1080,
+            None,
+            None,
+            BilibiliCdn::BaseUrl,
+        )
+        .unwrap();
         assert_eq!(extracted.title.as_deref(), Some("t"));
         assert_eq!(extracted.engagement.as_ref().unwrap().views, Some(10));
         assert!(matches!(
-            extracted.items[0].source,
-            MediaSource::Separated { .. }
+            &extracted.items[0].source,
+            MediaSource::Streams { stream, audio: Some(audio), .. }
+                if stream.urls.len() == 1 && audio.urls.len() == 1
         ));
         assert!(extracted.engagement.as_ref().unwrap().likes.is_some());
+    }
+
+    #[test]
+    fn durl_uses_backup_when_primary_is_invalid() {
+        let play = serde_json::json!({
+            "durl": [{ "url": "invalid", "backup_url": ["//mirror.example/v.mp4"] }]
+        });
+        let source =
+            play_source(&play, 1080, None, BilibiliCdn::BaseUrl, HeaderMap::new()).unwrap();
+        let MediaSource::Streams { stream, audio, .. } = source else {
+            panic!("{source:?}");
+        };
+        assert_eq!(stream.urls, [url("https://mirror.example/v.mp4")]);
+        assert!(audio.is_none());
     }
 
     #[test]
@@ -327,7 +356,6 @@ mod tests {
 
     #[test]
     fn stream_choice_fits_upload_limit() {
-        use super::video::play_source;
         // 100 s; audio 128 kbps; 1080p 8 Mbps (~102 MB), 720p 3 Mbps (~39 MB).
         let play = serde_json::json!({
             "dash": {
@@ -339,8 +367,14 @@ mod tests {
                 "audio": [{ "baseUrl": "https://upos.example/a.m4s", "bandwidth": 128_000 }]
             }
         });
-        let video_url = |max: Option<u64>| match play_source(&play, 1080, max) {
-            Some(MediaSource::Separated { video, .. }) => video.to_string(),
+        let video_url = |max: Option<u64>| match play_source(
+            &play,
+            1080,
+            max,
+            BilibiliCdn::BaseUrl,
+            HeaderMap::new(),
+        ) {
+            Some(MediaSource::Streams { stream, .. }) => stream.urls[0].to_string(),
             other => panic!("{other:?}"),
         };
         assert!(video_url(None).ends_with("1080.m4s"));
@@ -351,18 +385,12 @@ mod tests {
     }
 
     #[test]
-    fn options_default_1080() {
-        let opts = merge_layers(
-            BilibiliExtractor::new(
-                BilibiliEndpoints::default(),
-                feedbot_site_common::testing::no_http(),
-                None,
-            )
-            .options(),
-            &OptionValues::new(),
-            &[],
-        )
-        .unwrap();
+    fn options_default_720_and_allow_1080() {
+        let opts = merge_layers(&SPEC, &OptionValues::new(), &[]).unwrap();
+        assert_eq!(quality_height(&opts), 720);
+        assert_eq!(quality_height(&OptionValues::new()), 720);
+
+        let opts = merge_layers(&SPEC, &OptionValues::new(), &["+q:1080".into()]).unwrap();
         assert_eq!(quality_height(&opts), 1080);
     }
 }

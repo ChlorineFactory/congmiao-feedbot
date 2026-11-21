@@ -7,7 +7,9 @@ mod presence;
 
 use crate::app::App;
 use crate::queue::QueuedJob;
-use deliver::{Outgoing, Post, Target, cache_entry, deliver, finish_delivery, send_page_link};
+use deliver::{
+    Outgoing, Post, Target, cache_entry, deliver, finish_delivery, send_page_link, send_text_post,
+};
 use feedbot_core::extract::{ExtractRequest, MediaKind, RequesterInfo};
 use feedbot_core::job::MediaCacheEntry;
 use feedbot_core::options::{OptionValue, OptionValues, split_option_tokens};
@@ -163,6 +165,18 @@ async fn run_once(app: &App, job: &QueuedJob, presence: &mut Presence) -> anyhow
         reply: reply_params(job),
     };
 
+    if total_items == 0 {
+        advance(app, job, JobState::Uploading).await?;
+        return send_text_post(
+            &target,
+            Post {
+                present,
+                extracted: &extracted,
+            },
+        )
+        .await;
+    }
+
     if let Some(page) = app
         .pipeline
         .overflow
@@ -197,7 +211,7 @@ async fn run_once(app: &App, job: &QueuedJob, presence: &mut Presence) -> anyhow
         source_key
     };
     let hits = app.store.get_cache_all(&source_key).await?;
-    if total_items > 0 && hits.len() == total_items {
+    if hits.len() == total_items {
         info!("cache hit");
         advance(app, job, JobState::Uploading).await?;
         presence.set_action(upload_action(hits[0].kind)).await;

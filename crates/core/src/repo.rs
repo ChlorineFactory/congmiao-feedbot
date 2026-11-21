@@ -137,7 +137,10 @@ pub trait CredentialRepo: Send + Sync {
         scope: Scope,
         scope_id: i64,
     ) -> Result<bool, StoreError>;
+    /// Metadata for the user's own credentials and the shared credentials.
     async fn list_for_user(&self, user_id: i64) -> Result<Vec<StoredCredentialMeta>, StoreError>;
+    /// Metadata for shared credentials only.
+    async fn list_global(&self) -> Result<Vec<StoredCredentialMeta>, StoreError>;
     /// Credentials that do not need a new login and were last checked before `before`.
     async fn due_for_check(
         &self,

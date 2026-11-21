@@ -85,6 +85,8 @@ format = "pretty"
 passport_base = "https://passport.bilibili.com"
 api_base = "https://api.bilibili.com"
 live_api_base = "https://api.live.bilibili.com"
+# Pick the first CDN to try: baseUrl, backupUrl, or a named mirror such as ali, cos, hw, akamai.
+cdn = "baseUrl"
 
 [netease]
 api_base = "http://127.0.0.1:3000"

@@ -25,10 +25,27 @@ pub fn build_caption_page(
     extracted: &Extracted,
     page: CaptionPage,
 ) -> RenderedText {
-    render_blocks(present::blocks(present, extracted, page))
+    render_blocks(present::blocks(present, extracted, page), CAPTION_LIMIT)
 }
 
-/// The layout's link buttons (e.g. "作者" / "原帖") for single-media posts.
+/// Ordinary messages show the full body and use the larger message limit.
+pub(crate) fn build_text_message(present: Present, extracted: &Extracted) -> RenderedText {
+    let blocks = present::blocks(present, extracted, CaptionPage::single(0))
+        .into_iter()
+        .map(|block| match block {
+            Block::Expandable(text) | Block::ExpandableClip(text) => {
+                Block::Line(vec![Span::plain(text)])
+            }
+            line => line,
+        });
+    let mut rendered = render_blocks(blocks, TEXT_LIMIT);
+    if rendered.caption.trim().is_empty() {
+        rendered.caption = html::link(extracted.canonical_url.as_str(), "原文");
+    }
+    rendered
+}
+
+/// The layout's link buttons (e.g. "作者" / "原帖") for posts sent as one message.
 pub fn media_keyboard(present: Present, extracted: &Extracted) -> Option<InlineKeyboardMarkup> {
     let row: Vec<InlineKeyboardButton> = present::actions(present, extracted)
         .into_iter()
@@ -39,8 +56,8 @@ pub fn media_keyboard(present: Present, extracted: &Extracted) -> Option<InlineK
     (!row.is_empty()).then(|| InlineKeyboardMarkup::new(vec![row]))
 }
 
-fn render_blocks(blocks: Vec<Block>) -> RenderedText {
-    let mut budget = CAPTION_LIMIT;
+fn render_blocks(blocks: impl IntoIterator<Item = Block>, limit: usize) -> RenderedText {
+    let mut budget = limit;
     let mut leftover = String::new();
     let mut caption = String::new();
     let mut pending = blocks.into_iter().peekable();
@@ -273,10 +290,13 @@ mod render_tests {
 
     #[test]
     fn later_expandable_overflows_to_extras() {
-        let rendered = render_blocks(vec![
-            Block::Line(vec![Span::plain("T")]),
-            Block::Expandable("x".repeat(2000)),
-        ]);
+        let rendered = render_blocks(
+            vec![
+                Block::Line(vec![Span::plain("T")]),
+                Block::Expandable("x".repeat(2000)),
+            ],
+            CAPTION_LIMIT,
+        );
         assert!(rendered.caption.contains("<blockquote expandable>"));
         assert!(!rendered.extras.is_empty());
         for extra in &rendered.extras {
@@ -286,10 +306,13 @@ mod render_tests {
 
     #[test]
     fn expandable_clip_notes_overflow_in_caption() {
-        let rendered = render_blocks(vec![
-            Block::Line(vec![Span::plain("T")]),
-            Block::ExpandableClip("x".repeat(2000)),
-        ]);
+        let rendered = render_blocks(
+            vec![
+                Block::Line(vec![Span::plain("T")]),
+                Block::ExpandableClip("x".repeat(2000)),
+            ],
+            CAPTION_LIMIT,
+        );
         assert!(rendered.caption.contains("<blockquote expandable>"));
         assert!(rendered.caption.contains("简介过长"));
         assert!(rendered.extras.is_empty());

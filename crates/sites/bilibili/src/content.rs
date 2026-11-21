@@ -1,6 +1,6 @@
 //! Live rooms, audio tracks, and columns.
 
-use super::links::parse_https_url;
+use super::{BilibiliCdn, links::parse_https_url};
 use feedbot_core::extract::{
     Engagement, ExtractError, Extracted, MediaItem, MediaKind, MediaSource,
 };
@@ -56,21 +56,20 @@ pub(super) fn audio_from_api(
     id: &str,
     song_root: &Value,
     stream: &Value,
-    headers: &HeaderMap,
+    headers: HeaderMap,
+    cdn: BilibiliCdn,
 ) -> Result<Extracted, ExtractError> {
     let song = song_root.get("data").unwrap_or(&Value::Null);
-    let mut sources: Vec<Url> = stream
+    let mut urls = stream
         .pointer("/data/cdns")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
-        .filter_map(parse_https_url)
-        .collect();
-    if sources.is_empty() {
-        return Err(ExtractError::Failed("没有可用的音频地址".into()));
-    }
-    let url = sources.remove(0);
+        .filter_map(parse_https_url);
+    let source = cdn
+        .order(urls.next(), urls)
+        .ok_or_else(|| ExtractError::Failed("没有可用的音频地址".into()))?;
     let cover = json_str(song, "/cover").and_then(parse_https_url);
     let uid = json_u64(song, "/uid");
     Ok(Extracted {
@@ -96,9 +95,10 @@ pub(super) fn audio_from_api(
         items: vec![MediaItem {
             id: format!("au{id}"),
             kind: MediaKind::Audio,
-            source: MediaSource::Direct {
-                url,
-                headers: headers.clone(),
+            source: MediaSource::Streams {
+                stream: source,
+                audio: None,
+                headers,
             },
             filename: Some(format!("bilibili-au{id}.m4a")),
             cover,

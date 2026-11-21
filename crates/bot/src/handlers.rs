@@ -55,22 +55,15 @@ async fn handle_callback(
     let private = matches!(msg.chat.kind, ChatKind::Private(_));
 
     match cb {
-        UiCallback::HelpOverview => {
-            let plats = ui::named_platforms(app.registry.all(), false);
-            let _ = ui::edit_page(
-                &bot,
-                msg.chat.id,
-                msg.id,
-                commands::help_overview(&app.registry),
-                ui::platform_keyboard(UiCallback::HelpPlatform, &plats),
-            )
-            .await;
+        UiCallback::HelpOverview | UiCallback::HelpPlatform(_) => {
             bot.answer_callback_query(q.id).await.ok();
-        }
-        UiCallback::HelpPlatform(id) => {
-            let (text, kb) = commands::help_platform_page(&app.registry, &id);
+            let name = if let UiCallback::HelpPlatform(id) = &cb {
+                id.as_str()
+            } else {
+                ""
+            };
+            let (text, kb) = commands::help_page(&app, name, private.then_some(user_id)).await;
             let _ = ui::edit_page(&bot, msg.chat.id, msg.id, text, kb).await;
-            bot.answer_callback_query(q.id).await.ok();
         }
         UiCallback::Set(id) => {
             let (text, kb) = commands::set_view_page(&app, &id, user_id, msg.chat.id.0).await?;
@@ -78,6 +71,15 @@ async fn handle_callback(
             bot.answer_callback_query(q.id).await.ok();
         }
         UiCallback::Logout(id) => {
+            if !private {
+                bot.answer_callback_query(q.id)
+                    .text("请私聊使用 /logout")
+                    .show_alert(true)
+                    .await
+                    .ok();
+                return Ok(());
+            }
+            login::abort(&dialogue).await;
             let (text, kb) = commands::logout_html(&app, &id, (Scope::User, user_id)).await?;
             let _ = ui::edit_page(&bot, msg.chat.id, msg.id, text, kb).await;
             bot.answer_callback_query(q.id).await.ok();
