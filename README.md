@@ -41,6 +41,35 @@ docker run -d --name feedbot \
 - The bot shuts down cleanly on SIGTERM (`docker stop`) and Ctrl-C.
 - NetEase needs the `ncm-api` sidecar (below). Point `FEEDBOT__NETEASE__API_BASE` at it, e.g. on a shared Docker network.
 
+### Docker Compose
+
+For a fresh deployment, copy `.env.example` to `.env`, set
+`FEEDBOT__TELEGRAM__TOKEN`, then start the bot.
+
+```bash
+cp .env.example .env
+# Edit .env before starting.
+docker compose up -d
+```
+
+When reusing an older `.env`, rename `TELEGRAM_BOT_TOKEN` to
+`FEEDBOT__TELEGRAM__TOKEN` and remove any empty `FEEDBOT__TELEGRAM__ADMIN_IDS` setting.
+
+Compose uses the published Linux amd64 image by default. To use a native ARM64
+build, run `docker build -t feedbot:local .` and set `FEEDBOT_IMAGE=feedbot:local`
+in `.env`. The `feedbot-v2-data` volume holds the database and any generated
+master key. Keep an older deployment's database volume as a backup when moving
+from v1, whose migrations differ.
+
+- Enable **NetEase** with `docker compose --profile netease up -d`. The bot reaches
+  `netease-api:3000` over the Compose network.
+- For **webhooks**, set the webhook variables below and enable the loopback port
+  mapping in `docker-compose.yml` when the reverse proxy runs on the host.
+- For a **local Telegram Bot API**, uncomment the three `telegram-local`
+  settings in your `.env`, fill in the API ID and hash, then run
+  `docker compose --profile telegram-local up -d`. When moving an existing bot
+  from the cloud API, follow [Telegram's logOut instructions](https://core.telegram.org/bots/api#logout).
+
 ### Credential encryption
 
 Saved logins are encrypted with ChaCha20-Poly1305 using the master key and bound
@@ -113,7 +142,7 @@ Age-gated or bot-walled YouTube URLs need `/login youtube`. Bilibili `-101` and 
 
 ## NetEase sidecar
 
-QR login and extract talk to [ncm-api](https://github.com/moefurina/ncm-api) (Docker image `moefurina/ncm-api`) at `http://127.0.0.1:3000` by default:
+QR login and extraction use the [NetEase Cloud Music API sidecar](https://github.com/NeteaseCloudMusicApiEnhanced/api-enhanced) (Docker image `moefurina/ncm-api`) at `http://127.0.0.1:3000` by default:
 
 ```toml
 [netease]
