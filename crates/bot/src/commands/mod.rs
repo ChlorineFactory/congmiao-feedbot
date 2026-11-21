@@ -10,7 +10,7 @@ use feedbot_extractors::ExtractorRegistry;
 use std::sync::Arc;
 use teloxide::prelude::*;
 use teloxide::types::{BotCommand, BotCommandScope, ChatKind};
-use teloxide::utils::command::BotCommands;
+use teloxide::utils::command::{BotCommands, ParseError};
 
 use crate::app::App;
 use crate::login::{self, LoginDialogue};
@@ -27,7 +27,7 @@ pub use set::usage_set;
 pub use sub::{usage_sub, usage_unsub};
 
 #[derive(BotCommands, Clone, Debug)]
-#[command(rename_rule = "lowercase")]
+#[command(rename_rule = "lowercase", parse_with = parse_command_args)]
 pub enum Command {
     #[command(description = "显示帮助，可加平台名查看该平台参数")]
     Help(String),
@@ -49,6 +49,11 @@ pub enum Command {
     Cancel,
     #[command(description = "关于本 bot")]
     Start,
+}
+
+// The derive already supplies the remaining command text as a String.
+fn parse_command_args(args: String) -> Result<(String,), ParseError> {
+    Ok((args,))
 }
 
 impl Command {
@@ -199,6 +204,22 @@ fn admin_only(action: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_parser_preserves_remaining_text() {
+        assert!(matches!(
+            Command::parse("/set@FEEDBOT  pixiv +q:regular", "feedbot"),
+            Ok(Command::Set(args)) if args == " pixiv +q:regular"
+        ));
+        assert!(matches!(
+            Command::parse("/help", "feedbot"),
+            Ok(Command::Help(args)) if args.is_empty()
+        ));
+        assert!(matches!(
+            Command::parse("/start campaign", "feedbot"),
+            Ok(Command::Start)
+        ));
+    }
 
     fn registry() -> ExtractorRegistry {
         ExtractorRegistry::builtin()

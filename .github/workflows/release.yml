@@ -1,0 +1,82 @@
+name: Release
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        description: Git tag to publish
+        required: true
+        type: string
+
+jobs:
+  linux:
+    name: Publish Linux x86_64 archive
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install musl tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - name: Build Linux x86_64 release
+        run: cargo build -p feedbot --release --locked --target x86_64-unknown-linux-musl
+      - name: Package release
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          archive="congmiao-feedbot-${RELEASE_TAG}-linux-x86_64.tar.gz"
+          install -Dm755 target/x86_64-unknown-linux-musl/release/feedbot package/feedbot
+          install -Dm644 README.md package/README.md
+          install -Dm644 config/default.toml package/config/default.toml
+          tar -C package -czf "$archive" .
+          sha256sum "$archive" > "$archive.sha256"
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            congmiao-feedbot-${{ inputs.tag }}-linux-x86_64.tar.gz
+            congmiao-feedbot-${{ inputs.tag }}-linux-x86_64.tar.gz.sha256
+
+  docker:
+    name: Publish GHCR image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Generate image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/congmiaofactory/congmiao-feedbot
+          tags: |
+            type=raw,value=${{ inputs.tag }}
+            type=semver,pattern={{version}},value=${{ inputs.tag }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ inputs.tag }}
+            type=sha
+      - name: Build and push image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
