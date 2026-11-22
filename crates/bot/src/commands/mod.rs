@@ -66,9 +66,11 @@ impl Command {
 }
 
 pub async fn install_menu(bot: &crate::app::TgBot) -> ResponseResult<()> {
+    tracing::debug!(scope = "private", "registering Telegram command menu");
     bot.set_my_commands(Command::bot_commands())
         .scope(BotCommandScope::AllPrivateChats)
         .await?;
+    tracing::debug!(scope = "group", "registering Telegram command menu");
     bot.set_my_commands(Command::group_commands())
         .scope(BotCommandScope::AllGroupChats)
         .await?;

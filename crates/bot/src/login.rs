@@ -5,11 +5,12 @@ use feedbot_core::auth::{
     AuthChallenge, AuthError, AuthInput, AuthMethod, AuthProgress, AuthSession, Credential,
 };
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use teloxide::dispatching::dialogue::InMemStorage;
 use teloxide::payloads::{SendMessageSetters, SendPhotoSetters};
 use teloxide::prelude::*;
 use teloxide::types::{ChatKind, InlineKeyboardButton, InlineKeyboardMarkup, InputFile};
+use teloxide::utils::html;
 use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
 
@@ -77,7 +78,7 @@ pub async fn begin(
             msg.chat.id,
             format!(
                 "未知平台 <code>{}</code>。用 /help 查看列表。",
-                teloxide::utils::html::escape(name.trim())
+                html::escape(name.trim())
             ),
         )
         .await?;
@@ -98,14 +99,33 @@ pub async fn begin(
         method: Some(method),
         ..AuthSession::default()
     };
-    let challenge = auth.begin(method, &mut session).await?;
+    let requested = Instant::now();
+    tracing::info!(extractor = ext.id(), %method, global, "starting login");
+    let challenge = match auth.begin(method, &mut session).await {
+        Ok(challenge) => challenge,
+        Err(error) => {
+            tracing::warn!(extractor = ext.id(), %method, elapsed_ms = requested.elapsed().as_millis(), "failed to prepare login challenge");
+            bot.send_message(msg.chat.id, html::escape(&error.to_string()))
+                .await?;
+            return Ok(());
+        }
+    };
     let secret = matches!(challenge, AuthChallenge::AskText { secret: true, .. });
     let cancel = CancellationToken::new();
     let poll_interval = match &challenge {
         AuthChallenge::ShowQr { poll_interval, .. } => Some(*poll_interval),
         _ => None,
     };
-    render_challenge(bot, msg.chat.id, &challenge).await?;
+    if render_challenge(bot, msg.chat.id, &challenge)
+        .await
+        .is_err()
+    {
+        tracing::warn!(extractor = ext.id(), %method, elapsed_ms = requested.elapsed().as_millis(), "failed to send login challenge");
+        bot.send_message(msg.chat.id, "发送登录提示失败，请重新 /login。")
+            .await?;
+        return Ok(());
+    }
+    tracing::info!(extractor = ext.id(), %method, elapsed_ms = requested.elapsed().as_millis(), "login challenge sent");
     dialogue
         .update(LoginState::InProgress {
             extractor_id: ext.id().into(),
@@ -144,9 +164,15 @@ pub async fn begin(
 /// Clear an in-progress login. Returns whether a login was actually running.
 pub async fn abort(dialogue: &LoginDialogue) -> bool {
     let state = dialogue.get().await.ok().flatten();
-    if let Some(LoginState::InProgress { cancel, .. }) = state {
+    if let Some(LoginState::InProgress {
+        cancel,
+        extractor_id,
+        ..
+    }) = state
+    {
         cancel.cancel();
         dialogue.update(LoginState::Idle).await.ok();
+        tracing::debug!(extractor = extractor_id, "cancelled login");
         true
     } else {
         false
@@ -333,12 +359,13 @@ async fn poll_qr(
                 )
                 .await
                 {
-                    tracing::warn!(error = %e, "failed to save QR login");
+                    tracing::warn!(extractor = extractor_id, "failed to complete QR login");
                     let _ = bot.send_message(chat, format!("保存登录态失败：{e}")).await;
                 }
                 return;
             }
             Err(AuthError::SessionExpired) => {
+                tracing::debug!(extractor = extractor_id, "QR code expired");
                 finish_with(
                     &bot,
                     chat,
@@ -351,14 +378,19 @@ async fn poll_qr(
             }
             Err(e) => {
                 errors += 1;
-                tracing::warn!(errors, error = %e, "QR poll failed");
                 // Report the first failure only; give up after a few in a row.
                 if errors >= QR_POLL_MAX_ERRORS {
+                    tracing::warn!(
+                        extractor = extractor_id,
+                        errors,
+                        "abandoning QR login after poll failures"
+                    );
                     let text = format!("多次查询扫码状态失败，已退出登录：{e}");
                     finish_with(&bot, chat, &dialogue, &cancel, &text).await;
                     return;
                 }
                 if errors == 1 {
+                    tracing::warn!(extractor = extractor_id, "QR poll failed; will retry");
                     let _ = bot
                         .send_message(chat, format!("查询扫码状态失败：{e}\n会继续重试。"))
                         .await;
@@ -367,6 +399,7 @@ async fn poll_qr(
         }
     }
     if !cancel.is_cancelled() {
+        tracing::debug!(extractor = extractor_id, "QR login timed out");
         finish_with(&bot, chat, &dialogue, &cancel, "扫码超时，请重新 /login。").await;
     }
 }
@@ -402,6 +435,7 @@ async fn finish_login(
         (Scope::User, user_id)
     };
     app.store.save(scope, scope_id, &cred).await?;
+    tracing::info!(extractor = extractor_id, scope = scope.as_str(), method = %cred.method, "saved login credential");
     let resumed = app
         .store
         .resume_after_login(

@@ -73,6 +73,13 @@ from v1, whose migrations differ.
 Telegram Bot API requests, including uploads, have a 180-second default timeout.
 Set `FEEDBOT__TELEGRAM__REQUEST_TIMEOUT_SECS` to change it.
 
+### Logs
+
+FeedBot uses `INFO` by default. To see detailed FeedBot logs, add
+`RUST_LOG=info,feedbot=debug` to `.env` and run
+`docker compose up -d --no-deps feedbot`. Follow the output with
+`docker compose logs -f feedbot`. Set `FEEDBOT__LOG__FORMAT=json` for JSON logs.
+
 ### Credential encryption
 
 Saved logins are encrypted with ChaCha20-Poly1305 using the master key and bound

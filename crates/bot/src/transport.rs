@@ -35,10 +35,10 @@ pub async fn dispatch(
             timeout,
             drop_pending,
         } => {
+            tracing::debug!(drop_pending, "deleting Telegram webhook before polling");
             bot.delete_webhook()
                 .drop_pending_updates(drop_pending)
                 .await?;
-            tracing::info!(drop_pending, "deleted Telegram webhook before polling");
             let mut builder = Polling::builder(bot.clone())
                 .timeout(timeout)
                 .allowed_updates(vec![AllowedUpdate::Message, AllowedUpdate::CallbackQuery]);
@@ -46,6 +46,11 @@ pub async fn dispatch(
                 builder = builder.drop_pending_updates();
             }
             let listener = builder.build();
+            tracing::info!(
+                timeout_secs = timeout.as_secs(),
+                drop_pending,
+                "starting Telegram long polling"
+            );
             dispatcher
                 .try_dispatch_with_listener(listener, LoggingErrorHandler::new())
                 .await
@@ -64,6 +69,7 @@ pub async fn dispatch(
                 options = options.secret_token(secret_token);
             }
             let address = options.address;
+            tracing::info!(%address, drop_pending, "registering Telegram webhook");
             let (listener, stop_flag, router) =
                 webhooks::axum_to_router(bot.clone(), options).await?;
             let router = Router::new()
@@ -72,6 +78,7 @@ pub async fn dispatch(
             tokio::spawn(async move {
                 match tokio::net::TcpListener::bind(address).await {
                     Ok(tcp) => {
+                        tracing::info!(%address, "Telegram webhook listener ready");
                         if let Err(e) = axum::serve(tcp, router)
                             .with_graceful_shutdown(stop_flag)
                             .await

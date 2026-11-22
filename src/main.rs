@@ -19,7 +19,7 @@ use feedbot_feed::{FeedScheduler, FeedSettings};
 use feedbot_media::{Downloader, FfmpegCli, YtdlpCli};
 use feedbot_store::SqliteStore;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use teloxide::dispatching::Dispatcher;
 use teloxide::dispatching::dialogue::InMemStorage;
 use teloxide::prelude::*;
@@ -30,15 +30,21 @@ use tracing_subscriber::EnvFilter;
 async fn main() -> anyhow::Result<()> {
     let cfg = AppConfig::load().context("load config")?;
     init_tracing(&cfg.log.format);
+    tracing::info!(version = env!("CARGO_PKG_VERSION"), mode = ?cfg.telegram.mode, "starting FeedBot");
 
     let token = cfg.token()?.to_string();
     let master_key = cfg.resolve_master_key()?;
     let api_url = cfg.api_url()?;
 
+    let opening_store = Instant::now();
     let store: Arc<dyn Store> = Arc::new(
         SqliteStore::connect(&cfg.database.path, &master_key)
             .await
             .context("open sqlite")?,
+    );
+    tracing::info!(
+        elapsed_ms = opening_store.elapsed().as_millis(),
+        "SQLite store ready"
     );
     let (timeout, connect) = cfg.http_timeouts();
     let http: Arc<dyn HttpClient> = Arc::new(
@@ -86,6 +92,21 @@ async fn main() -> anyhow::Result<()> {
         Duration::from_secs(cfg.telegram.request_timeout_secs),
     )
     .context("build Telegram client")?;
+    tracing::info!(
+        scheme = api_url.scheme(),
+        host = api_url.host_str().unwrap_or_default(),
+        port = api_url.port_or_known_default(),
+        timeout_secs = cfg.telegram.request_timeout_secs,
+        "configured Telegram Bot API"
+    );
+    match cfg.netease.api_base.parse::<url::Url>() {
+        Ok(netease_url) => tracing::info!(
+            host = netease_url.host_str().unwrap_or_default(),
+            port = netease_url.port_or_known_default(),
+            "configured NetEase API"
+        ),
+        Err(_) => tracing::warn!("invalid NetEase API URL"),
+    }
 
     let (jobs, job_rx) = JobQueue::channel(256, store.clone());
 
@@ -131,9 +152,15 @@ async fn main() -> anyhow::Result<()> {
         sub_interval: Duration::from_secs(cfg.feed.sub_interval_secs),
     });
 
+    tracing::info!("registering Telegram commands");
+    let registering_commands = Instant::now();
     feedbot_bot::commands::install_menu(&bot)
         .await
         .context("set_my_commands")?;
+    tracing::info!(
+        elapsed_ms = registering_commands.elapsed().as_millis(),
+        "Telegram commands registered"
+    );
 
     let cancel = CancellationToken::new();
     tokio::spawn(worker::run_worker_pool(

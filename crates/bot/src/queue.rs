@@ -5,6 +5,7 @@ use teloxide::prelude::*;
 use teloxide::sugar::request::RequestReplyExt;
 use teloxide::types::{ChatId, MessageId};
 use tokio::sync::mpsc;
+use tracing::{debug, error, info, warn};
 use url::Url;
 use uuid::Uuid;
 
@@ -76,14 +77,22 @@ impl JobQueue {
 
     /// Persist and enqueue a new job. Fails without blocking when the queue is full.
     pub async fn submit(&self, job: QueuedJob) -> Result<Uuid, StoreError> {
-        self.store.insert_job(&job.record()).await?;
         let id = job.id;
+        self.store
+            .insert_job(&job.record())
+            .await
+            .inspect_err(|_| {
+                error!(job_id = %id, "failed to persist queued job");
+            })?;
         if let Err(e) = self.tx.try_send(job) {
+            let queue_closed = matches!(&e, mpsc::error::TrySendError::Closed(_));
+            warn!(job_id = %id, queue_closed, "job queue rejected submission");
             self.store
                 .set_state(id, JobState::Failed, Some("queue full"))
                 .await?;
             return Err(StoreError::Db(format!("任务队列已满: {e}")));
         }
+        debug!(job_id = %id, "job enqueued");
         Ok(id)
     }
 
@@ -99,13 +108,17 @@ impl JobQueue {
 pub async fn recover_unfinished(app: &App) {
     let jobs = match app.store.unfinished().await {
         Ok(jobs) => jobs,
-        Err(e) => {
-            tracing::error!(error = %e, "failed to recover jobs");
+        Err(_) => {
+            error!("failed to load unfinished jobs");
             return;
         }
     };
+    if !jobs.is_empty() {
+        info!(jobs = jobs.len(), "recovering unfinished jobs");
+    }
     for job in jobs {
         if job.state == JobState::Uploading {
+            warn!(job_id = %job.id, "abandoning job interrupted during upload");
             let _ = app
                 .store
                 .set_state(

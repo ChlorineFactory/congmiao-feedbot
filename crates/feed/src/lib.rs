@@ -18,7 +18,7 @@ use std::time::Duration;
 use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// `cursor` value stored once the first poll has filled the seen set.
 const CURSOR_READY: &str = "ready";
@@ -66,10 +66,37 @@ enum PollError {
     Extract(#[from] ExtractError),
     #[error("{0}")]
     Store(#[from] StoreError),
+    #[error("{0}")]
+    Enqueue(StoreError),
     #[error("没有可订阅该来源的解析器")]
     NoExtractor,
     #[error("拉取超时")]
     Timeout,
+}
+
+impl PollError {
+    // Upstream error messages can embed request URLs or response content.
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Extract(ExtractError::NoExtractor) | Self::NoExtractor => "no_extractor",
+            Self::Extract(ExtractError::AuthRequired(_)) => "auth_required",
+            Self::Extract(ExtractError::Network(_)) => "network",
+            Self::Extract(ExtractError::Failed(_)) => "extract_failed",
+            Self::Extract(ExtractError::Options(_)) => "invalid_options",
+            Self::Extract(ExtractError::Unsupported) => "unsupported",
+            Self::Store(error) => store_error_kind(error),
+            Self::Enqueue(_) => "enqueue",
+            Self::Timeout => "poll_timeout",
+        }
+    }
+}
+
+fn store_error_kind(error: &StoreError) -> &'static str {
+    match error {
+        StoreError::Db(_) => "database",
+        StoreError::Crypto(_) => "crypto",
+        StoreError::NotFound => "not_found",
+    }
 }
 
 impl FeedScheduler {
@@ -92,6 +119,15 @@ impl FeedScheduler {
     }
 
     pub async fn run(self, cancel: CancellationToken) {
+        info!(
+            tick_secs = self.settings.tick.as_secs(),
+            poll_concurrency = self.settings.poll_concurrency,
+            poll_timeout_secs = self.settings.poll_timeout.as_secs(),
+            push_limit = self.settings.push_limit,
+            max_fail_count = self.settings.max_fail_count,
+            credential_check_secs = self.settings.credential_check_interval.as_secs(),
+            "feed scheduler started"
+        );
         let mut interval = tokio::time::interval(self.settings.tick);
         interval.set_missed_tick_behavior(MissedTickBehavior::Delay);
         let mut last_prune: Option<tokio::time::Instant> = None;
@@ -100,10 +136,10 @@ impl FeedScheduler {
                 _ = cancel.cancelled() => break,
                 _ = interval.tick() => {
                     if let Err(e) = self.poll_due().await {
-                        warn!(error = %e, "feed tick failed");
+                        warn!(error_kind = store_error_kind(&e), "failed to list due subscriptions");
                     }
                     if let Err(e) = self.check_credentials().await {
-                        warn!(error = %e, "credential check failed");
+                        warn!(error_kind = store_error_kind(&e), "credential check storage failure");
                     }
                     if last_prune.is_none_or(|t| t.elapsed() >= PRUNE_EVERY) {
                         self.prune_jobs().await;
@@ -117,10 +153,18 @@ impl FeedScheduler {
     async fn poll_due(&self) -> Result<(), StoreError> {
         let now = OffsetDateTime::now_utc();
         let due = self.store.due(now).await?;
+        if !due.is_empty() {
+            debug!(subscriptions = due.len(), "polling due subscriptions");
+        }
         stream::iter(due)
             .for_each_concurrent(self.settings.poll_concurrency.max(1), |sub| async move {
                 if let Err(e) = self.poll_and_record(&sub, now).await {
-                    warn!(sub = %sub.id, error = %e, "failed to record subscription poll");
+                    warn!(
+                        sub = %sub.id,
+                        extractor = %sub.extractor_id,
+                        error_kind = store_error_kind(&e),
+                        "failed to record subscription poll"
+                    );
                 }
             })
             .await;
@@ -134,31 +178,44 @@ impl FeedScheduler {
     ) -> Result<(), StoreError> {
         match self.poll(sub).await {
             Ok(outcome) => {
+                let next_due_at = next_due(now, sub.interval_secs);
+                self.store
+                    .mark_ran(sub.id, Some(CURSOR_READY), next_due_at, 0, true)
+                    .await?;
                 match outcome {
                     Poll::Initialized(n) => {
-                        info!(sub = %sub.id, entries = n, "initialized subscription");
+                        info!(
+                            sub = %sub.id,
+                            extractor = %sub.extractor_id,
+                            entries = n,
+                            %next_due_at,
+                            "initialized subscription"
+                        );
                     }
-                    Poll::Pushed(0) => {}
-                    Poll::Pushed(n) => info!(sub = %sub.id, pushed = n, "subscription pushed"),
+                    Poll::Pushed(0) => {
+                        debug!(
+                            sub = %sub.id,
+                            extractor = %sub.extractor_id,
+                            %next_due_at,
+                            "no new subscription entries"
+                        );
+                    }
+                    Poll::Pushed(n) => {
+                        info!(
+                            sub = %sub.id,
+                            extractor = %sub.extractor_id,
+                            queued = n,
+                            %next_due_at,
+                            "queued subscription entries"
+                        );
+                    }
                 }
-                self.store
-                    .mark_ran(
-                        sub.id,
-                        Some(CURSOR_READY),
-                        next_due(now, sub.interval_secs),
-                        0,
-                        true,
-                    )
-                    .await
+                Ok(())
             }
             Err(PollError::Extract(ExtractError::AuthRequired(_))) => {
-                info!(sub = %sub.id, "subscription needs a login; paused");
                 self.pause_for_login(sub).await
             }
-            Err(e) => {
-                warn!(sub = %sub.id, error = %e, "subscription poll failed");
-                self.fail(sub, now, &e).await
-            }
+            Err(e) => self.fail(sub, now, &e).await,
         }
     }
 
@@ -183,6 +240,14 @@ impl FeedScheduler {
             return Ok(Poll::Initialized(fresh.len()));
         }
         // Entries arrive newest first; push the newest few, oldest of them first.
+        if fresh.len() > self.settings.push_limit {
+            debug!(
+                sub = %sub.id,
+                extractor = %sub.extractor_id,
+                skipped = fresh.len() - self.settings.push_limit,
+                "subscription push limit reached"
+            );
+        }
         fresh.truncate(self.settings.push_limit);
         fresh.reverse();
         for (pushed, entry) in fresh.iter().enumerate() {
@@ -198,10 +263,18 @@ impl FeedScheduler {
             if let Err(e) = enqueued {
                 // Queue full or store error: un-see what was not pushed so the
                 // next poll retries it instead of skipping it for good.
+                debug!(
+                    sub = %sub.id,
+                    extractor = %sub.extractor_id,
+                    queued = pushed,
+                    pending = fresh.len() - pushed,
+                    error_kind = store_error_kind(&e),
+                    "subscription enqueue interrupted"
+                );
                 for rest in &fresh[pushed..] {
                     self.store.forget_seen(sub.id, &rest.key).await?;
                 }
-                return Err(e.into());
+                return Err(PollError::Enqueue(e));
             }
         }
         Ok(Poll::Pushed(fresh.len()))
@@ -247,6 +320,7 @@ impl FeedScheduler {
         if !self.store.pause_for_login(sub.id).await? {
             return Ok(());
         }
+        info!(sub = %sub.id, extractor = %sub.extractor_id, "subscription paused for login");
         let name = self
             .extractors
             .by_id(&sub.extractor_id)
@@ -276,16 +350,33 @@ impl FeedScheduler {
         let backoff = sub
             .interval_secs
             .saturating_mul(2i64.pow(fail_count.clamp(0, 6) as u32));
+        let next_due_at = next_due(now, backoff);
         self.store
             .mark_ran(
                 sub.id,
                 sub.cursor.as_deref(),
-                next_due(now, backoff),
+                next_due_at,
                 fail_count,
                 enabled,
             )
             .await?;
-        if !enabled {
+        if enabled {
+            warn!(
+                sub = %sub.id,
+                extractor = %sub.extractor_id,
+                error_kind = err.kind(),
+                fail_count,
+                %next_due_at,
+                "subscription poll failed; retry scheduled"
+            );
+        } else {
+            warn!(
+                sub = %sub.id,
+                extractor = %sub.extractor_id,
+                error_kind = err.kind(),
+                fail_count,
+                "subscription disabled after repeated failures"
+            );
             let _ = self
                 .publisher
                 .publish_text(
@@ -306,7 +397,11 @@ impl FeedScheduler {
                 i64::try_from(self.settings.credential_check_interval.as_secs())
                     .unwrap_or(i64::MAX),
             );
-        for (meta, cred) in self.store.due_for_check(before).await? {
+        let due = self.store.due_for_check(before).await?;
+        if !due.is_empty() {
+            debug!(credentials = due.len(), "checking due credentials");
+        }
+        for (meta, cred) in due {
             let Some(extractor) = self.extractors.by_id(&meta.extractor_id) else {
                 continue;
             };
@@ -324,8 +419,11 @@ impl FeedScheduler {
                 // stored status and try again after the next interval.
                 Ok(CredentialStatus::Unknown) => (meta.status, None),
                 Ok(status) => (status, None),
-                Err(e) => {
-                    warn!(extractor = %meta.extractor_id, error = %e, "credential check error");
+                Err(_) => {
+                    warn!(
+                        extractor = extractor.id(),
+                        "credential check failed; preserving previous status"
+                    );
                     (meta.status, None)
                 }
             };
@@ -338,6 +436,14 @@ impl FeedScheduler {
                     refreshed.as_ref(),
                 )
                 .await?;
+            if status != meta.status || refreshed.is_some() {
+                debug!(
+                    extractor = extractor.id(),
+                    status = status.as_str(),
+                    refreshed = refreshed.is_some(),
+                    "updated credential status"
+                );
+            }
             if status.needs_login() {
                 self.notify_invalid(&meta).await;
             }
@@ -367,8 +473,8 @@ impl FeedScheduler {
             meta.extractor_id
         );
         for chat in recipients {
-            if let Err(e) = self.publisher.publish_text(chat, &text).await {
-                warn!(chat, error = %e, "failed to notify invalid credential");
+            if self.publisher.publish_text(chat, &text).await.is_err() {
+                warn!(extractor = %meta.extractor_id, "failed to notify invalid credential");
             }
         }
     }
@@ -384,7 +490,7 @@ impl FeedScheduler {
         {
             Ok(0) => {}
             Ok(n) => info!(deleted = n, "pruned finished jobs"),
-            Err(e) => warn!(error = %e, "prune jobs failed"),
+            Err(e) => warn!(error_kind = store_error_kind(&e), "prune jobs failed"),
         }
     }
 }

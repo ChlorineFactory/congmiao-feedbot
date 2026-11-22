@@ -1,5 +1,6 @@
 //! Turning extracted media items into local files ready for upload.
 
+use super::media_failure_kind;
 use crate::app::{App, MediaTools};
 use feedbot_core::extract::{MediaItem, MediaKind, MediaSource};
 use feedbot_core::{
@@ -9,7 +10,7 @@ use feedbot_core::{
 use http::HeaderMap;
 use std::path::{Path, PathBuf};
 use tokio::task::JoinSet;
-use tracing::warn;
+use tracing::{Instrument, debug, warn};
 
 const TELEGRAM_PHOTO_MAX_BYTES: u64 = 10_000_000;
 const TELEGRAM_PHOTO_MAX_EDGE_SUM: u64 = 10_000;
@@ -31,23 +32,30 @@ pub(super) async fn prepare_all(
     for (idx, item) in items.into_iter().enumerate() {
         let tools = app.pipeline.media.clone();
         let dir = dir.to_path_buf();
-        set.spawn(async move {
-            let _permit = tools.limit.clone().acquire_owned().await?;
-            let outcome = prepare_one(idx, item, &tools, &dir).await;
-            anyhow::Ok((idx, outcome))
-        });
+        set.spawn(
+            async move {
+                let _permit = tools.limit.clone().acquire_owned().await?;
+                let outcome = prepare_one(idx, item, &tools, &dir).await;
+                anyhow::Ok((idx, outcome))
+            }
+            .in_current_span(),
+        );
     }
 
     let mut prepared = Vec::new();
     let mut skipped = Vec::new();
-    let mut first_error: Option<(usize, anyhow::Error)> = None;
+    let mut first_error: Option<(usize, MediaError)> = None;
     while let Some(joined) = set.join_next().await {
         let (idx, outcome) = joined.map_err(|e| anyhow::anyhow!("download task: {e}"))??;
         match outcome {
             Ok(PrepareOutcome::Ready(item)) => prepared.push(item),
             Ok(PrepareOutcome::Skip(reason)) => skipped.push((idx, reason)),
             Err(e) => {
-                warn!(idx, error = %e, "media item failed");
+                warn!(
+                    item_index = idx + 1,
+                    cause = media_failure_kind(&e),
+                    "media item preparation failed"
+                );
                 skipped.push((idx, format!("第 {} 项失败：{e}", idx + 1)));
                 if first_error.as_ref().is_none_or(|(i, _)| idx < *i) {
                     first_error = Some((idx, e));
@@ -61,7 +69,7 @@ pub(super) async fn prepare_all(
         && total > 0
         && let Some((_, e)) = first_error
     {
-        return Err(e);
+        return Err(e.into());
     }
     prepared.sort_by_key(|p| p.idx);
     skipped.sort_by_key(|(idx, _)| *idx);
@@ -88,7 +96,7 @@ async fn prepare_one(
     item: MediaItem,
     tools: &MediaTools,
     dir: &Path,
-) -> anyhow::Result<PrepareOutcome> {
+) -> Result<PrepareOutcome, MediaError> {
     let MediaTools {
         downloader,
         processor: media,
@@ -96,9 +104,11 @@ async fn prepare_one(
         max_upload_bytes,
         ..
     } = tools;
+    let item_index = idx + 1;
     let mut thumb_url = item.cover.clone();
     let (mut path, mut filename, mut kind) = match item.source {
         MediaSource::Direct { url, headers } => {
+            debug!(item_index, kind = ?item.kind, "downloading media file");
             let path = dir.join(safe_name(item.filename.as_deref(), idx));
             downloader.to_file(&url, &headers, &path).await?;
             (path, item.filename, item.kind)
@@ -108,6 +118,12 @@ async fn prepare_one(
             audio,
             headers,
         } => {
+            debug!(
+                item_index,
+                kind = ?item.kind,
+                separate_audio = audio.is_some(),
+                "downloading media streams"
+            );
             if let Some(audio) = audio {
                 let vpath = dir.join(format!("{idx}_v.bin"));
                 let apath = dir.join(format!("{idx}_a.bin"));
@@ -116,6 +132,7 @@ async fn prepare_one(
                     downloader.to_file_with_fallback(&stream, &headers, &vpath),
                     downloader.to_file_with_fallback(&audio, &headers, &apath),
                 )?;
+                debug!(item_index, "remuxing downloaded streams");
                 media.remux(&[vpath, apath], &out).await?;
                 (out, Some("video.mp4".into()), MediaKind::Video)
             } else {
@@ -131,6 +148,11 @@ async fn prepare_one(
             headers,
             frames,
         } => {
+            debug!(
+                item_index,
+                frames = frames.len(),
+                "downloading ugoira archive"
+            );
             let zip_path = dir.join(format!("{idx}_ugoira.zip"));
             let work = dir.join(format!("{idx}_ugoira"));
             tokio::fs::create_dir_all(&work)
@@ -138,6 +160,7 @@ async fn prepare_one(
                 .map_err(|e| MediaError::Io(e.to_string()))?;
             let out = dir.join(format!("{idx}_ugoira.mp4"));
             downloader.to_file(&zip, &headers, &zip_path).await?;
+            debug!(item_index, "encoding ugoira animation");
             media.ugoira_to_mp4(&zip_path, &frames, &work, &out).await?;
             (out, Some("ugoira.mp4".into()), MediaKind::Animation)
         }
@@ -148,6 +171,12 @@ async fn prepare_one(
             thumbnail,
             cookies,
         } => {
+            debug!(
+                item_index,
+                audio_only,
+                ?max_height,
+                "downloading with yt-dlp"
+            );
             let (ext, kind) = if audio_only {
                 ("m4a", MediaKind::Audio)
             } else {
@@ -194,6 +223,12 @@ async fn prepare_one(
         match prepare_photo(&path, size, &work_dir, media.as_ref(), max_bytes).await {
             Ok(Some((photo_path, photo_size))) => {
                 if photo_path != path {
+                    debug!(
+                        item_index,
+                        original_bytes = size,
+                        output_bytes = photo_size,
+                        "re-encoded photo"
+                    );
                     filename = photo_path
                         .file_name()
                         .map(|name| name.to_string_lossy().into_owned());
@@ -201,9 +236,16 @@ async fn prepare_one(
                 }
                 size = photo_size;
             }
-            Ok(None) => kind = MediaKind::Document,
+            Ok(None) => {
+                debug!(item_index, "photo requires document delivery");
+                kind = MediaKind::Document;
+            }
             Err(error) => {
-                warn!(idx, %error, "photo preparation failed; keeping original");
+                warn!(
+                    item_index,
+                    cause = media_failure_kind(&error),
+                    "photo preparation failed; keeping original"
+                );
                 kind = MediaKind::Document;
                 cacheable = false;
             }
@@ -211,12 +253,23 @@ async fn prepare_one(
     }
 
     if matches!(kind, MediaKind::Video | MediaKind::Animation) && size > *max_upload_bytes {
+        debug!(
+            item_index,
+            bytes = size,
+            limit_bytes = *max_upload_bytes,
+            "transcoding media to fit upload limit"
+        );
         let tc = dir.join(format!("{idx}_tc.mp4"));
         let spec = TranscodeSpec {
             max_bytes: max_upload_bytes.saturating_sub(1024 * 1024).max(1),
             ..TranscodeSpec::default()
         };
         if let Err(e) = media.transcode(&path, &tc, &spec).await {
+            warn!(
+                item_index,
+                cause = media_failure_kind(&e),
+                "skipping media after transcode failure"
+            );
             return Ok(PrepareOutcome::Skip(format!(
                 "第 {} 项转码失败：{e}",
                 idx + 1
@@ -229,6 +282,12 @@ async fn prepare_one(
     }
 
     if size > *max_upload_bytes {
+        warn!(
+            item_index,
+            bytes = size,
+            limit_bytes = *max_upload_bytes,
+            "skipping media over upload limit"
+        );
         return Ok(PrepareOutcome::Skip(format!(
             "第 {} 项超过上传上限（{size} 字节）",
             idx + 1
@@ -247,6 +306,7 @@ async fn prepare_one(
         }
     }
 
+    debug!(item_index, ?kind, bytes = size, "media ready for delivery");
     Ok(PrepareOutcome::Ready(PreparedMedia {
         idx,
         kind,

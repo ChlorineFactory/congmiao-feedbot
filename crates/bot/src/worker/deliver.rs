@@ -20,6 +20,7 @@ use teloxide::types::{
     InputMediaDocument, InputMediaPhoto, InputMediaVideo, LinkPreviewOptions, ReplyParameters,
 };
 use teloxide::utils::html;
+use tracing::debug;
 use url::Url;
 
 /// Where a job's output goes.
@@ -59,6 +60,7 @@ impl Post<'_> {
 }
 
 pub(super) async fn send_text_post(target: &Target<'_>, post: Post<'_>) -> anyhow::Result<()> {
+    debug!("sending text post to Telegram");
     let rendered = caption::build_text_message(post.present, post.extracted);
     let mut request = target.message(&rendered.caption);
     if let Some(markup) = caption::media_keyboard(post.present, post.extracted) {
@@ -179,10 +181,21 @@ pub(super) async fn deliver(
     let kinds: Vec<MediaKind> = items.iter().map(|i| i.kind).collect();
     let plans = album::plan_groups_with_max(&kinds, app.pipeline.album_max);
     let group_count = plans.len();
+    debug!(
+        items = total,
+        groups = group_count,
+        "planned Telegram delivery"
+    );
     let mut sent = Vec::with_capacity(total);
-    for plan in plans {
+    for (group_index, plan) in plans.into_iter().enumerate() {
+        let group_number = group_index + 1;
         match plan {
             SendPlan::Single(i) => {
+                debug!(
+                    group_number,
+                    kind = ?items[i].kind,
+                    "sending single item to Telegram"
+                );
                 let cap = caption_for_index(post, i, total);
                 let markup = (total == 1)
                     .then(|| caption::media_keyboard(post.present, post.extracted))
@@ -192,6 +205,11 @@ pub(super) async fn deliver(
                 sent.push((i, msg));
             }
             SendPlan::Album(idxs) => {
+                debug!(
+                    group_number,
+                    items = idxs.len(),
+                    "sending album to Telegram"
+                );
                 let media = album_media(post, items, &idxs, spoiler);
                 let mut req = target.bot.send_media_group(target.chat, media);
                 if let Some(rp) = &target.reply {

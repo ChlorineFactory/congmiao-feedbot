@@ -13,15 +13,16 @@ use deliver::{
 use feedbot_core::extract::{ExtractRequest, MediaKind, RequesterInfo};
 use feedbot_core::job::MediaCacheEntry;
 use feedbot_core::options::{OptionValue, OptionValues, split_option_tokens};
-use feedbot_core::{ExtractError, JobState, MediaError, load_saved_options};
+use feedbot_core::{ExtractError, JobState, MediaError, StoreError, load_saved_options};
 use prepare::prepare_all;
 use presence::Presence;
 use std::sync::Arc;
 use std::time::Duration;
+use teloxide::RequestError;
 use teloxide::types::{ChatAction, ChatId, MessageId, ReplyParameters};
 use tokio::sync::{Semaphore, mpsc};
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, error, info, warn};
+use tracing::{Instrument, debug, error, info, warn};
 
 /// The job was cancelled (`/cancel`) or finished elsewhere; stop silently.
 #[derive(Debug, thiserror::Error)]
@@ -58,8 +59,8 @@ pub async fn run_worker_pool(
         tokio::spawn(
             async move {
                 let _permit = permit;
-                if let Err(e) = process_job(app, job).await {
-                    error!(error = %e, "job failed");
+                if process_job(app, job).await.is_err() {
+                    error!("failed to save final job state");
                 }
             }
             .instrument(span),
@@ -76,6 +77,7 @@ async fn process_job(app: Arc<App>, job: QueuedJob) -> anyhow::Result<()> {
         match run_once(&app, &job, &mut presence).await {
             Ok(()) => {
                 app.store.set_state(job.id, JobState::Done, None).await?;
+                info!(attempt, "job completed");
                 presence.stop().await;
                 return Ok(());
             }
@@ -85,24 +87,96 @@ async fn process_job(app: Arc<App>, job: QueuedJob) -> anyhow::Result<()> {
                 return Ok(());
             }
             Err(e) if is_retryable(&e) && attempt < max_attempts => {
-                warn!(attempt, error = %e, "retrying job");
+                let delay = Duration::from_secs(2u64.pow(attempt));
+                warn!(
+                    attempt,
+                    max_attempts,
+                    delay_secs = delay.as_secs(),
+                    cause = job_failure_kind(&e),
+                    "retrying job"
+                );
                 presence.stop_refresh();
-                tokio::time::sleep(Duration::from_secs(2u64.pow(attempt))).await;
+                tokio::time::sleep(delay).await;
                 attempt += 1;
             }
             Err(e) => break e,
         }
     };
+    let failure = job_failure_message(&err, attempt);
     let still_running = app
         .store
-        .set_state(job.id, JobState::Failed, Some(&err.to_string()))
+        .set_state(job.id, JobState::Failed, Some(&failure))
         .await?;
     if still_running {
-        presence.fail(&format!("失败：{err}")).await;
+        presence.fail(&format!("失败：{failure}")).await;
     } else {
         presence.stop().await;
     }
     Ok(())
+}
+
+fn job_failure_message(error: &anyhow::Error, attempt: u32) -> String {
+    let Some(RequestError::Network(source)) = error.downcast_ref::<RequestError>() else {
+        warn!(attempt, cause = job_failure_kind(error), "job failed");
+        return error.to_string();
+    };
+    let (cause, message) = if source.is_connect() {
+        ("connect", "无法连接 Telegram Bot API")
+    } else if source.is_timeout() {
+        ("timeout", "请求 Telegram Bot API 超时")
+    } else if source.is_body() {
+        ("body", "向 Telegram Bot API 发送数据失败")
+    } else {
+        ("transport", "请求 Telegram Bot API 时发生网络错误")
+    };
+    let io_kind = error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .map(std::io::Error::kind)
+    });
+    warn!(
+        attempt,
+        cause,
+        timed_out = source.is_timeout(),
+        ?io_kind,
+        "Telegram Bot API request failed"
+    );
+    message.into()
+}
+
+fn job_failure_kind(error: &anyhow::Error) -> &'static str {
+    if let Some(error) = error.downcast_ref::<ExtractError>() {
+        return match error {
+            ExtractError::NoExtractor => "no_extractor",
+            ExtractError::AuthRequired(_) => "authentication_required",
+            ExtractError::Network(_) => "extract_network",
+            ExtractError::Failed(_) => "extract_failed",
+            ExtractError::Options(_) => "extract_options",
+            ExtractError::Unsupported => "unsupported_link",
+        };
+    }
+    if let Some(error) = error.downcast_ref::<MediaError>() {
+        return media_failure_kind(error);
+    }
+    if error.is::<RequestError>() {
+        "telegram_request"
+    } else if error.is::<StoreError>() {
+        "store"
+    } else {
+        "unexpected"
+    }
+}
+
+fn media_failure_kind(error: &MediaError) -> &'static str {
+    match error {
+        MediaError::MissingBinary => "missing_ffmpeg",
+        MediaError::Ffmpeg(_) => "ffmpeg",
+        MediaError::MissingYtdlp => "missing_yt_dlp",
+        MediaError::Ytdlp(_) => "yt_dlp",
+        MediaError::Download(_) => "download",
+        MediaError::TooLarge(_) => "download_size_limit",
+        MediaError::Io(_) => "media_io",
+    }
 }
 
 fn is_retryable(err: &anyhow::Error) -> bool {
@@ -118,6 +192,7 @@ fn is_retryable(err: &anyhow::Error) -> bool {
 /// Record progress; aborts the run when the job was cancelled meanwhile.
 async fn advance(app: &App, job: &QueuedJob, state: JobState) -> anyhow::Result<()> {
     if app.store.set_state(job.id, state, None).await? {
+        info!(stage = state.as_str(), "job stage started");
         Ok(())
     } else {
         Err(JobCancelled.into())
@@ -135,7 +210,7 @@ async fn run_once(app: &App, job: &QueuedJob, presence: &mut Presence) -> anyhow
     };
     let (tokens, leftover) = split_option_tokens(&job.raw_args);
     if !leftover.is_empty() {
-        warn!(leftover = ?leftover, "ignored unrecognized option fragments");
+        warn!("ignored unrecognized option fragments");
     }
     let saved =
         load_saved_options(app.store.as_ref(), extractor.id(), job.user_id, job.chat_id).await?;
@@ -153,12 +228,18 @@ async fn run_once(app: &App, job: &QueuedJob, presence: &mut Presence) -> anyhow
     };
     // Extraction always runs, even on a cache hit: it doubles as the access
     // check (login, deletion) and refreshes caption metadata.
+    debug!(platform = extractor.id(), "requesting metadata");
     let mut extracted = extractor.extract(&app.pipeline.extract_ctx, &req).await?;
     drop(extract_permit);
 
     let spoiler = media_spoiler(&options, extracted.nsfw);
     let present = extractor.present();
     let total_items = extracted.items.len();
+    info!(
+        platform = extractor.id(),
+        items = total_items,
+        "extraction completed"
+    );
     let target = Target {
         bot: &app.bot,
         chat: ChatId(job.chat_id),
@@ -183,7 +264,7 @@ async fn run_once(app: &App, job: &QueuedJob, presence: &mut Presence) -> anyhow
         .publish_page(&extracted, &source_key)
         .await
     {
-        info!(page = %page, items = total_items, "published as page");
+        info!(items = total_items, "published as Telegraph page");
         advance(app, job, JobState::Uploading).await?;
         send_page_link(
             &target,
@@ -212,7 +293,7 @@ async fn run_once(app: &App, job: &QueuedJob, presence: &mut Presence) -> anyhow
     };
     let hits = app.store.get_cache_all(&source_key).await?;
     if hits.len() == total_items {
-        info!("cache hit");
+        info!(items = hits.len(), "using cached Telegram files");
         advance(app, job, JobState::Uploading).await?;
         presence.set_action(upload_action(hits[0].kind)).await;
         let outgoing: Vec<Outgoing> = hits.iter().map(Outgoing::cached).collect();
@@ -247,6 +328,11 @@ async fn run_once(app: &App, job: &QueuedJob, presence: &mut Presence) -> anyhow
     let dir = tempfile::tempdir().map_err(|e| MediaError::Io(e.to_string()))?;
     let items = std::mem::take(&mut extracted.items);
     let (prepared, skipped) = prepare_all(app, items, dir.path()).await?;
+    info!(
+        prepared = prepared.len(),
+        skipped = skipped.len(),
+        "media preparation completed"
+    );
 
     advance(app, job, JobState::Uploading).await?;
     presence
@@ -276,10 +362,8 @@ async fn run_once(app: &App, job: &QueuedJob, presence: &mut Presence) -> anyhow
             .iter()
             .filter_map(|(pos, msg)| cache_entry(&source_key, *pos, outgoing[*pos].kind, msg))
             .collect();
-        if entries.len() == outgoing.len()
-            && let Err(e) = app.store.put_many(&entries).await
-        {
-            warn!(error = %e, "failed to store media cache");
+        if entries.len() == outgoing.len() && app.store.put_many(&entries).await.is_err() {
+            warn!("failed to store media cache");
         }
     }
     finish_delivery(

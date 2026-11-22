@@ -15,8 +15,9 @@ use feedbot_site_common::render_qr_png;
 use http::HeaderMap;
 use serde_json::Value;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use time::OffsetDateTime;
+use tracing::{debug, warn};
 use url::Url;
 
 use feedbot_site_common::{credential_text, json_str, json_u64, parse_url, trim_slash};
@@ -212,11 +213,14 @@ impl NeteaseExtractor {
     async fn sidecar_get(
         &self,
         ctx: &ExtractCtx,
-        path: &str,
+        path: &'static str,
         params: &[(&str, &str)],
         cookie: Option<&str>,
     ) -> Result<Value, ExtractError> {
-        let mut url = Url::parse(&format!("{}{path}", self.api_base)).map_err(|_| sidecar_err())?;
+        let mut url = Url::parse(&format!("{}{path}", self.api_base)).map_err(|_| {
+            debug!(route = path, "Invalid NetEase sidecar endpoint");
+            sidecar_err()
+        })?;
         {
             let mut q = url.query_pairs_mut();
             for (k, v) in params {
@@ -226,9 +230,7 @@ impl NeteaseExtractor {
                 q.append_pair("cookie", c);
             }
         }
-        let resp = ctx
-            .http
-            .fetch(HttpRequest::get(url, HeaderMap::new()))
+        let resp = fetch_sidecar(ctx.http.as_ref(), path, url)
             .await
             .map_err(map_extract_sidecar)?;
         if resp.status == 0 || resp.status >= 500 {
@@ -237,7 +239,7 @@ impl NeteaseExtractor {
         if !(200..300).contains(&resp.status) {
             return Err(ExtractError::Network(format!("HTTP {}", resp.status)));
         }
-        serde_json::from_slice(&resp.body).map_err(|e| ExtractError::Failed(e.to_string()))
+        parse_sidecar_json(&resp, path).map_err(|e| ExtractError::Failed(e.to_string()))
     }
 
     async fn extract_song(
@@ -575,6 +577,38 @@ fn sidecar_err() -> ExtractError {
     ExtractError::Failed("未连接网易云 API".into())
 }
 
+// Only the fixed route is logged. The request URL can contain credentials.
+async fn fetch_sidecar(
+    http: &dyn HttpClient,
+    route: &'static str,
+    url: Url,
+) -> Result<HttpResponse, ExtractError> {
+    let started = Instant::now();
+    let result = http.fetch(HttpRequest::get(url, HeaderMap::new())).await;
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+    match &result {
+        Ok(resp) => debug!(
+            route,
+            status = resp.status,
+            elapsed_ms,
+            "NetEase sidecar response"
+        ),
+        Err(error) => {
+            let kind = match error {
+                ExtractError::Network(_) => "network",
+                _ => "request",
+            };
+            debug!(route, kind, elapsed_ms, "NetEase sidecar request failed");
+        }
+    }
+    result
+}
+
+fn parse_sidecar_json(resp: &HttpResponse, route: &'static str) -> serde_json::Result<Value> {
+    serde_json::from_slice(&resp.body)
+        .inspect_err(|_| debug!(route, "NetEase sidecar returned invalid JSON"))
+}
+
 fn map_extract_sidecar(err: ExtractError) -> ExtractError {
     match err {
         ExtractError::Network(msg)
@@ -625,27 +659,50 @@ struct NeteaseAuth {
 impl NeteaseAuth {
     async fn sidecar(
         &self,
-        path: &str,
+        path: &'static str,
         params: &[(&str, &str)],
     ) -> Result<HttpResponse, AuthError> {
-        let mut url = Url::parse(&format!("{}{path}", self.api_base))
-            .map_err(|_| AuthError::Failed("未连接网易云 API".into()))?;
+        let mut url = Url::parse(&format!("{}{path}", self.api_base)).map_err(|_| {
+            debug!(route = path, "Invalid NetEase sidecar endpoint");
+            AuthError::Failed("未连接网易云 API".into())
+        })?;
         url.query_pairs_mut()
             .extend_pairs(params)
             .append_pair("timestamp", &timestamp_ms());
-        self.http
-            .fetch(HttpRequest::get(url, HeaderMap::new()))
+        fetch_sidecar(self.http.as_ref(), path, url)
             .await
             .map_err(map_auth_sidecar)
     }
 
-    /// Sidecar GET that must succeed with a JSON body.
-    async fn sidecar_json(&self, path: &str, params: &[(&str, &str)]) -> Result<Value, AuthError> {
-        let resp = self.sidecar(path, params).await?;
+    /// A QR login startup request that must succeed with a JSON body.
+    async fn sidecar_json(
+        &self,
+        path: &'static str,
+        params: &[(&str, &str)],
+    ) -> Result<Value, AuthError> {
+        let resp = self.sidecar(path, params).await.inspect_err(|_| {
+            warn!(route = path, kind = "request", "NetEase QR start failed");
+        })?;
         if !(200..300).contains(&resp.status) {
-            return Err(AuthError::Failed("未连接网易云 API".into()));
+            warn!(
+                route = path,
+                kind = "http_status",
+                status = resp.status,
+                "NetEase QR start failed"
+            );
+            return Err(AuthError::Failed(format!(
+                "网易云 API {path} 返回 HTTP {}",
+                resp.status
+            )));
         }
-        serde_json::from_slice(&resp.body).map_err(|e| AuthError::Failed(e.to_string()))
+        serde_json::from_slice(&resp.body).map_err(|_| {
+            warn!(
+                route = path,
+                kind = "invalid_json",
+                "NetEase QR start failed"
+            );
+            AuthError::Failed(format!("网易云 API {path} 返回了无效的 JSON"))
+        })
     }
 
     async fn check_qr(&self, key: &str, no_cookie: bool) -> Result<HttpResponse, AuthError> {
@@ -673,7 +730,14 @@ impl AuthProvider for NeteaseAuth {
         }
         let root = self.sidecar_json("/login/qr/key", &[]).await?;
         let key = json_str(&root, "/data/unikey")
-            .ok_or_else(|| AuthError::Failed("网易云响应缺少 unikey".into()))?
+            .ok_or_else(|| {
+                warn!(
+                    route = "/login/qr/key",
+                    kind = "missing_key",
+                    "NetEase QR start failed"
+                );
+                AuthError::Failed("网易云响应缺少 unikey".into())
+            })?
             .to_string();
         let created = self
             .sidecar_json(
@@ -681,13 +745,21 @@ impl AuthProvider for NeteaseAuth {
                 &[("key", key.as_str()), ("qrimg", "true")],
             )
             .await?;
-        let qrurl = json_str(&created, "/data/qrurl")
-            .ok_or_else(|| AuthError::Failed("网易云响应缺少二维码地址".into()))?;
+        let qrurl = json_str(&created, "/data/qrurl").ok_or_else(|| {
+            warn!(
+                route = "/login/qr/create",
+                kind = "missing_qr_content",
+                "NetEase QR start failed"
+            );
+            AuthError::Failed("网易云响应缺少二维码地址".into())
+        })?;
         session.method = Some(AuthMethod::QrCode);
         session.step = 0;
         session.blob = serde_json::json!({ "unikey": key });
+        let png = render_qr_png(qrurl).inspect_err(|_| warn!("NetEase QR rendering failed"))?;
+        debug!("NetEase QR challenge created");
         Ok(AuthChallenge::ShowQr {
-            png: render_qr_png(qrurl)?,
+            png,
             expires_at: OffsetDateTime::now_utc() + time::Duration::seconds(180),
             poll_interval: Duration::from_secs(3),
         })
@@ -710,6 +782,7 @@ impl AuthProvider for NeteaseAuth {
                     .to_string();
                 let mut response = self.check_qr(&key, false).await?;
                 if response.status == 502 {
+                    debug!("Retrying NetEase QR poll after HTTP 502 with noCookie");
                     response = self.check_qr(&key, true).await?;
                 }
                 if response.status >= 500 {
@@ -718,9 +791,11 @@ impl AuthProvider for NeteaseAuth {
                 if !(200..300).contains(&response.status) {
                     return Err(AuthError::Failed(format!("HTTP {}", response.status)));
                 }
-                let root: Value = serde_json::from_slice(&response.body)
+                let root = parse_sidecar_json(&response, "/login/qr/check")
                     .map_err(|e| AuthError::Failed(e.to_string()))?;
-                match ncm_poll_code(root.get("code").and_then(Value::as_i64)) {
+                let code = root.get("code").and_then(Value::as_i64);
+                debug!(?code, "NetEase QR poll returned a protocol status");
+                match ncm_poll_code(code) {
                     NcmPoll::Waiting => Ok(AuthProgress::Pending),
                     NcmPoll::Scanned => {
                         if session.step == 0 {
@@ -737,6 +812,7 @@ impl AuthProvider for NeteaseAuth {
                             .and_then(Value::as_str)
                             .filter(|v| !v.is_empty())
                             .ok_or_else(|| {
+                                debug!("NetEase QR success response is missing the cookie field");
                                 AuthError::Failed("网易云扫码成功但响应中没有 Cookie".into())
                             })?;
                         Ok(AuthProgress::Completed(Credential {
@@ -769,14 +845,16 @@ impl AuthProvider for NeteaseAuth {
         if resp.status >= 500 {
             return Err(AuthError::Failed("未连接网易云 API".into()));
         }
-        let root: Value =
-            serde_json::from_slice(&resp.body).map_err(|e| AuthError::Failed(e.to_string()))?;
+        let root = parse_sidecar_json(&resp, "/login/status")
+            .map_err(|e| AuthError::Failed(e.to_string()))?;
         let code = root
             .pointer("/data/code")
             .or_else(|| root.get("code"))
             .and_then(Value::as_i64)
             .unwrap_or(-1);
-        if code == 200 || root.pointer("/data/profile").is_some() {
+        let valid = code == 200 || root.pointer("/data/profile").is_some();
+        debug!(code, valid, "NetEase credential status checked");
+        if valid {
             Ok(CredentialStatus::Valid)
         } else {
             Ok(CredentialStatus::Invalid)
