@@ -86,12 +86,15 @@ impl App {
     }
 }
 
-pub fn build_bot(token: &str, api_url: &url::Url) -> TgBot {
-    Bot::new(token)
+pub fn build_bot(token: &str, api_url: &url::Url, timeout: Duration) -> anyhow::Result<TgBot> {
+    let client = teloxide::net::default_reqwest_settings()
+        .timeout(timeout)
+        .build()?;
+    Ok(Bot::with_client(token, client)
         .set_api_url(api_url.clone())
         .throttle(Limits::default())
         .cache_me()
-        .parse_mode(ParseMode::Html)
+        .parse_mode(ParseMode::Html))
 }
 
 pub fn user_limiter(per_minute: u32) -> Arc<UserLimiter> {

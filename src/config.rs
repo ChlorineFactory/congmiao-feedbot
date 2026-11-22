@@ -36,6 +36,7 @@ pub struct TelegramConfig {
     pub token: String,
     pub api_url: String,
     pub admin_ids: Vec<i64>,
+    pub request_timeout_secs: u64,
     pub mode: TelegramMode,
     pub polling: PollingConfig,
     pub webhook: WebhookConfig,
@@ -209,6 +210,10 @@ impl AppConfig {
     fn validate(&self) -> Result<(), String> {
         let positive = [
             (
+                "telegram.request_timeout_secs",
+                self.telegram.request_timeout_secs,
+            ),
+            (
                 "limits.extract_permits",
                 u64::from(self.limits.extract_permits),
             ),
@@ -249,6 +254,13 @@ impl AppConfig {
         ];
         if let Some((key, _)) = positive.iter().find(|(_, v)| *v == 0) {
             return Err(format!("配置 {key} 必须大于 0"));
+        }
+        if self.telegram.mode == TelegramMode::Polling
+            && self.telegram.request_timeout_secs <= self.telegram.polling.timeout_secs
+        {
+            return Err(
+                "配置 telegram.request_timeout_secs 必须大于 telegram.polling.timeout_secs".into(),
+            );
         }
         if !(2..=10).contains(&self.output.album_max) {
             return Err(format!(
@@ -407,6 +419,7 @@ mod tests {
         let cfg: AppConfig = cfg.try_deserialize().unwrap();
         assert!(cfg.telegram.token.is_empty());
         assert_eq!(cfg.telegram.mode, TelegramMode::Polling);
+        assert_eq!(cfg.telegram.request_timeout_secs, 180);
         assert_eq!(cfg.output.overflow, OverflowMode::Chunk);
         assert!(cfg.telegraph.access_token.is_empty());
         assert_eq!(cfg.bilibili.cdn, BilibiliCdn::BaseUrl);
@@ -443,6 +456,14 @@ mod tests {
     #[test]
     fn validation_rejects_stalling_values() {
         assert_eq!(defaults().validate(), Ok(()));
+
+        let mut cfg = defaults();
+        cfg.telegram.request_timeout_secs = cfg.telegram.polling.timeout_secs;
+        assert!(
+            cfg.validate()
+                .unwrap_err()
+                .contains("telegram.request_timeout_secs")
+        );
 
         let mut cfg = defaults();
         cfg.limits.max_attempts = 0;

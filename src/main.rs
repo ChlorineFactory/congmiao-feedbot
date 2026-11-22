@@ -80,7 +80,12 @@ async fn main() -> anyhow::Result<()> {
         FfmpegCli::new(&cfg.ffmpeg.ffmpeg, &cfg.ffmpeg.ffprobe)
             .with_timeout(Duration::from_secs(cfg.ffmpeg.timeout_secs)),
     );
-    let bot = build_bot(&token, &api_url);
+    let bot = build_bot(
+        &token,
+        &api_url,
+        Duration::from_secs(cfg.telegram.request_timeout_secs),
+    )
+    .context("build Telegram client")?;
 
     let (jobs, job_rx) = JobQueue::channel(256, store.clone());
 

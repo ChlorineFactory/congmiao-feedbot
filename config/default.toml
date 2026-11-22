@@ -1,6 +1,8 @@
 [telegram]
 api_url = "https://api.telegram.org"
 admin_ids = []
+# Total time for one Bot API request, including media uploads.
+request_timeout_secs = 180
 # "polling" or "webhook"
 mode = "polling"
 

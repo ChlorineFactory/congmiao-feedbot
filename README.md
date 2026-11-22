@@ -70,6 +70,9 @@ from v1, whose migrations differ.
   `docker compose --profile telegram-local up -d`. When moving an existing bot
   from the cloud API, follow [Telegram's logOut instructions](https://core.telegram.org/bots/api#logout).
 
+Telegram Bot API requests, including uploads, have a 180-second default timeout.
+Set `FEEDBOT__TELEGRAM__REQUEST_TIMEOUT_SECS` to change it.
+
 ### Credential encryption
 
 Saved logins are encrypted with ChaCha20-Poly1305 using the master key and bound
