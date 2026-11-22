@@ -277,13 +277,13 @@ pub fn fold_fullwidth(input: &str) -> String {
         .collect()
 }
 
-/// Split a message (already URL-stripped) into option tokens plus leftovers.
+/// Split a message (already URL-stripped) into named option tokens plus leftovers.
 pub fn split_option_tokens(raw: &str) -> (Vec<String>, Vec<String>) {
     let folded = fold_fullwidth(raw);
     let mut opts = Vec::new();
     let mut leftover = Vec::new();
     for token in folded.split_whitespace() {
-        if token.starts_with('+') || token.starts_with('-') {
+        if option_parts(token).is_some() {
             opts.push(token.to_string());
         } else {
             leftover.push(token.to_string());
@@ -306,13 +306,10 @@ pub struct ParsedToken {
     action: Action,
 }
 
-fn parse_one(spec: &OptionSpec, token: &str) -> Result<ParsedToken, OptionError> {
-    if token.len() < 2 {
-        return Err(unknown(spec, token));
-    }
-    let sign = token.as_bytes()[0] as char;
+fn option_parts(token: &str) -> Option<(char, &str, Option<&str>)> {
+    let sign = token.chars().next()?;
     if sign != '+' && sign != '-' {
-        return Err(unknown(spec, token));
+        return None;
     }
     let rest = &token[1..];
     let (name_raw, value) = match rest.find([':', '=']) {
@@ -328,8 +325,13 @@ fn parse_one(spec: &OptionSpec, token: &str) -> Result<ParsedToken, OptionError>
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_')
     {
-        return Err(unknown(spec, token));
+        return None;
     }
+    Some((sign, name_raw, value))
+}
+
+fn parse_one(spec: &OptionSpec, token: &str) -> Result<ParsedToken, OptionError> {
+    let (sign, name_raw, value) = option_parts(token).ok_or_else(|| unknown(spec, token))?;
     let def = spec.get(name_raw).ok_or_else(|| unknown(spec, token))?;
     let name = def.name.to_string();
 
@@ -757,8 +759,11 @@ mod tests {
 
     #[test]
     fn leftover_tokens_are_separated() {
-        let (opts, leftover) = split_option_tokens("hello +sp world");
-        assert_eq!(opts, vec!["+sp".to_string()]);
-        assert_eq!(leftover, vec!["hello".to_string(), "world".to_string()]);
+        let (opts, leftover) = split_option_tokens("hello +sp - world ＋ — -2026 -曲名");
+        assert_eq!(opts, ["+sp"]);
+        assert_eq!(
+            leftover,
+            ["hello", "-", "world", "+", "-", "-2026", "-曲名"]
+        );
     }
 }

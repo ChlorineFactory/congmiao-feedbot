@@ -271,6 +271,26 @@ mod tests {
     }
 
     #[test]
+    fn bilibili_share_title_allows_inline_quality() {
+        let link = "https://www.bilibili.com/video/BV1FWs66jEnz/";
+        let message = format!("【[零协汉化] 月亮计划10周年纪念动画 (Mili - City Blue)】 {link}");
+        let found = [FoundUrl {
+            url: Url::parse(link).unwrap(),
+            raw: Some(link.into()),
+        }];
+        let registry = ExtractorRegistry::builtin();
+        let extractor = registry.match_url(&found[0].url).unwrap();
+        for (inline, quality) in [("", "720"), (" +q:1080", "1080")] {
+            let rest = strip_urls(&format!("{message}{inline}"), &found);
+            let (tokens, _) = feedbot_core::split_option_tokens(&rest);
+            let opts = extractor
+                .resolve_options(&Default::default(), &tokens)
+                .unwrap();
+            assert_eq!(opts.get("q").unwrap().to_string(), quality);
+        }
+    }
+
+    #[test]
     fn only_web_schemes_are_links() {
         assert!(parse_web_url("https://x.com/a/status/1").is_some());
         assert!(parse_web_url("ftp://x.com/a").is_none());
