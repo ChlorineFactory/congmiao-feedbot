@@ -9,19 +9,32 @@
 ARG RUST_VERSION=1.99
 ARG DEBIAN_RELEASE=trixie
 
-FROM rust:${RUST_VERSION}-${DEBIAN_RELEASE} AS builder
+FROM rust:${RUST_VERSION}-${DEBIAN_RELEASE} AS chef
 WORKDIR /app
+# Use the Rust version installed by the base image in every build stage.
+ENV RUSTUP_TOOLCHAIN=$RUST_VERSION
+ARG CARGO_CHEF_VERSION=0.1.78
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    cargo install --locked --version "=${CARGO_CHEF_VERSION}" cargo-chef
+
+FROM chef AS planner
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates crates
+COPY src src
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS builder
+# The compiled dependencies must live in an image layer so the GitHub Actions
+# cache can restore them on a new runner.
+COPY --from=planner /app/recipe.json recipe.json
+RUN cargo chef cook --release --locked -p feedbot --recipe-path recipe.json
 # Only what the compile reads (migrations are embedded by sqlx::migrate!), so
 # edits to docs or config do not invalidate this stage.
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates crates
 COPY src src
 COPY migrations migrations
-# rust-toolchain.toml asks for "stable"; build with the image's toolchain
-# instead of downloading another one.
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/app/target \
-    RUSTUP_TOOLCHAIN="$RUST_VERSION" cargo build --release --locked -p feedbot \
+RUN cargo build --release --locked -p feedbot \
     && cp target/release/feedbot /usr/local/bin/feedbot
 
 FROM debian:${DEBIAN_RELEASE}-slim AS ffmpeg
