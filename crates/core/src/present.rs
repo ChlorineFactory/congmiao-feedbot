@@ -175,7 +175,7 @@ fn gallery_blocks(extracted: &Extracted, page: CaptionPage) -> Vec<Block> {
         }
     }
 
-    if page.total > 1 {
+    if page.total > 1 && page.index > 0 {
         spans.push(Span::atom(format!(" {}/{}", page.index + 1, page.total)));
     }
 
@@ -222,7 +222,7 @@ fn post_header(extracted: &Extracted, page: CaptionPage) -> Option<Vec<Span>> {
     if extracted.nsfw {
         spans.push(Span::plain("#NSFW"));
     }
-    if page.total > 1 {
+    if page.total > 1 && page.index > 0 {
         if !spans.is_empty() {
             spans.push(Span::atom(" "));
         }

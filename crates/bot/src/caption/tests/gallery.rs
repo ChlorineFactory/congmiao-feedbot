@@ -88,7 +88,7 @@ fn tags_and_description_are_expandable() {
             .caption
             .contains(" / <a href=\"https://example.com/u/1\">bob</a>")
     );
-    assert!(rendered.caption.contains(" 1/3"));
+    assert!(!rendered.caption.contains(" 1/3"));
     assert!(
         rendered
             .caption
@@ -203,9 +203,11 @@ fn later_album_group_uses_starting_page() {
 }
 
 #[test]
-fn each_media_group_item_has_its_own_page() {
+fn only_later_media_group_items_show_page_numbers() {
     let extracted = sample(Some("T"), Some("bob"), None, &[], 12, false, false, true);
-    for (index, token) in [(0, " 1/12"), (1, " 2/12"), (9, " 10/12"), (11, " 12/12")] {
+    let first = build_caption_page(&extracted, CaptionPage::single(12));
+    assert!(!first.caption.contains(" 1/12"));
+    for (index, token) in [(1, " 2/12"), (2, " 3/12"), (9, " 10/12"), (11, " 12/12")] {
         let rendered = build_caption_page(&extracted, CaptionPage { index, total: 12 });
         assert!(
             rendered.caption.contains(token),

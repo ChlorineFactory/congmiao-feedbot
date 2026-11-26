@@ -86,14 +86,16 @@ fn text_only_post_keeps_the_body_visible_and_splits_at_the_message_limit() {
 }
 
 #[test]
-fn album_pages_use_index_over_total() {
+fn only_later_album_pages_show_the_index_over_total() {
     let extracted = sample(Some("hi"), false, 4, None, false);
     let first = build_caption_page(&extracted, CaptionPage { index: 0, total: 4 });
-    assert!(first.caption.contains("1/4"));
+    assert!(!first.caption.contains("1/4"));
     assert!(!first.caption.contains("2/4"));
-    let second = build_caption_page(&extracted, CaptionPage { index: 1, total: 4 });
-    assert!(second.caption.contains("2/4"));
-    assert!(!second.caption.contains("1/4"));
+    for (index, marker) in [(1, "2/4"), (2, "3/4")] {
+        let rendered = build_caption_page(&extracted, CaptionPage { index, total: 4 });
+        assert!(rendered.caption.contains(marker));
+        assert!(!rendered.caption.contains("1/4"));
+    }
 }
 
 #[test]
