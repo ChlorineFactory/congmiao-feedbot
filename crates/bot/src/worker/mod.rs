@@ -10,7 +10,7 @@ use crate::queue::QueuedJob;
 use deliver::{
     Outgoing, Post, Target, cache_entry, deliver, finish_delivery, send_page_link, send_text_post,
 };
-use feedbot_core::extract::{ExtractRequest, MediaKind, RequesterInfo};
+use feedbot_core::extract::{ExtractRequest, MediaKind, MediaSource, RequesterInfo};
 use feedbot_core::job::MediaCacheEntry;
 use feedbot_core::options::{OptionValue, OptionValues, split_option_tokens};
 use feedbot_core::{ExtractError, JobState, MediaError, StoreError, load_saved_options};
@@ -288,6 +288,20 @@ async fn run_once(app: &App, job: &QueuedJob, presence: &mut Presence) -> anyhow
         let max_photo_bytes = prepare::telegram_photo_max_bytes(&app.pipeline.media);
         let max_upload_bytes = app.pipeline.media.max_upload_bytes;
         format!("{source_key}#telegram-photo-v3-{max_photo_bytes}-{max_upload_bytes}")
+    } else {
+        source_key
+    };
+    // Telegram retains the filename of a cached upload.
+    let source_key = if extracted.items.iter().any(|item| {
+        matches!(
+            item.source,
+            MediaSource::YtDlp {
+                audio_only: true,
+                ..
+            }
+        )
+    }) {
+        format!("{source_key}#telegram-ytdlp-audio-title-v1")
     } else {
         source_key
     };

@@ -19,7 +19,7 @@ use std::sync::Arc;
 use url::Url;
 
 use feedbot_site_common::{
-    credential_text, json_count, parse_url, rewrite_host, strip_cookie_header,
+    credential_text, json_count, media_filename_stem, parse_url, rewrite_host, strip_cookie_header,
 };
 
 const VERIFY_URL: &str = "https://www.youtube.com/watch?v=jNQXAC9IVRw";
@@ -223,6 +223,12 @@ fn extracted_from_probe(
             cover: None,
         }
     } else if music {
+        let stem = media_filename_stem(title.as_deref().unwrap_or_default());
+        let filename = if stem.is_empty() {
+            format!("youtube-{id}.m4a")
+        } else {
+            format!("{stem}.m4a")
+        };
         MediaItem {
             id: id.to_string(),
             kind: MediaKind::Audio,
@@ -233,7 +239,7 @@ fn extracted_from_probe(
                 thumbnail: thumb,
                 cookies,
             },
-            filename: Some("audio.m4a".into()),
+            filename: Some(filename),
             cover: None,
         }
     } else {
@@ -676,7 +682,7 @@ mod tests {
             "jNQXAC9IVRw",
             Some("SID=abc".into()),
             serde_json::json!({
-                "title": "song",
+                "title": " 夜曲 / Live: 夏日? ",
                 "uploader": "A",
                 "view_count": 12,
                 "like_count": 3
@@ -685,6 +691,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(music.items[0].kind, MediaKind::Audio);
+        assert_eq!(
+            music.items[0].filename.as_deref(),
+            Some("夜曲 _ Live_ 夏日_.m4a")
+        );
+        assert_eq!(music.title.as_deref(), Some("夜曲 / Live: 夏日?"));
         match &music.items[0].source {
             MediaSource::YtDlp {
                 audio_only,
@@ -698,6 +709,22 @@ mod tests {
         }
         assert_eq!(music.engagement.as_ref().unwrap().views, Some(12));
         assert_eq!(music.canonical_url.host_str(), Some("music.youtube.com"));
+    }
+
+    #[test]
+    fn music_filename_falls_back_to_video_id_without_title() {
+        let music = extracted_from_probe(
+            &url("https://music.youtube.com/watch?v=jNQXAC9IVRw"),
+            "jNQXAC9IVRw",
+            None,
+            serde_json::json!({}),
+            &OptionValues::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            music.items[0].filename.as_deref(),
+            Some("youtube-jNQXAC9IVRw.m4a")
+        );
     }
 
     #[test]

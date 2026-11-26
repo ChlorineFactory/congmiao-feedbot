@@ -20,7 +20,9 @@ use time::OffsetDateTime;
 use tracing::{debug, warn};
 use url::Url;
 
-use feedbot_site_common::{credential_text, json_str, json_u64, parse_url, trim_slash};
+use feedbot_site_common::{
+    credential_text, json_str, json_u64, media_filename_stem, parse_url, trim_slash,
+};
 
 /// Upper bound on track ids remembered per playlist/album subscription poll.
 const FEED_LIMIT: usize = 1000;
@@ -465,19 +467,7 @@ fn artists_of(song: &Value) -> String {
 }
 
 fn song_filename(title: &str, id: &str, format: &str) -> String {
-    let mut safe: String = title
-        .chars()
-        .map(|ch| {
-            if ch.is_control() || matches!(ch, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
-            {
-                '_'
-            } else {
-                ch
-            }
-        })
-        .take(120)
-        .collect();
-    safe = safe.trim_matches([' ', '.']).to_string();
+    let mut safe = media_filename_stem(title);
     if safe.is_empty() {
         safe = format!("netease-{id}");
     }

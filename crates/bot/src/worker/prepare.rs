@@ -198,8 +198,10 @@ async fn prepare_one(
             if thumbnail.is_some() {
                 thumb_url = thumbnail;
             }
-            let name = if audio_only { "audio.m4a" } else { "video.mp4" };
-            (dest, Some(name.into()), kind)
+            let name = item
+                .filename
+                .unwrap_or_else(|| if audio_only { "audio.m4a" } else { "video.mp4" }.into());
+            (dest, Some(name), kind)
         }
     };
 

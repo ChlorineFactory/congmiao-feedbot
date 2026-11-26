@@ -86,6 +86,23 @@ pub fn last_path_segment(url: &Url) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Clean title text for use as the stem of a suggested media filename.
+pub fn media_filename_stem(title: &str) -> String {
+    let stem: String = title
+        .chars()
+        .map(|ch| {
+            if ch.is_control() || matches!(ch, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+            {
+                '_'
+            } else {
+                ch
+            }
+        })
+        .take(120)
+        .collect();
+    stem.trim_matches([' ', '.']).to_string()
+}
+
 /// Keep the 1-based inclusive page range `+p:start-end`.
 pub fn select_pages<T>(mut items: Vec<T>, range: Option<(i64, i64)>) -> Vec<T> {
     let Some((start, end)) = range else {

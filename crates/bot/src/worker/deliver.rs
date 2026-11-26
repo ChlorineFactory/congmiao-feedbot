@@ -200,8 +200,18 @@ pub(super) async fn deliver(
                 let markup = (total == 1)
                     .then(|| caption::media_keyboard(post.present, post.extracted))
                     .flatten();
-                let msg = send_single(target, &items[i], cap.as_deref(), spoiler, markup.as_ref())
-                    .await?;
+                let title = (total == 1)
+                    .then_some(post.extracted.title.as_deref())
+                    .flatten();
+                let msg = send_single(
+                    target,
+                    &items[i],
+                    cap.as_deref(),
+                    spoiler,
+                    markup.as_ref(),
+                    title,
+                )
+                .await?;
                 sent.push((i, msg));
             }
             SendPlan::Album(idxs) => {
@@ -268,6 +278,7 @@ async fn send_single(
     caption: Option<&str>,
     spoiler: bool,
     markup: Option<&InlineKeyboardMarkup>,
+    title: Option<&str>,
 ) -> anyhow::Result<Message> {
     let (bot, chat, file) = (target.bot, target.chat, item.file.clone());
     let msg = match item.kind {
@@ -300,6 +311,9 @@ async fn send_single(
         }
         MediaKind::Audio => {
             let mut req = common!(bot.send_audio(chat, file), target, caption, markup);
+            if let Some(title) = title {
+                req = req.title(title);
+            }
             if let Some(thumb) = &item.thumbnail {
                 req = req.thumbnail(InputFile::file(thumb.clone()));
             }
