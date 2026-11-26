@@ -132,6 +132,7 @@ fn is_shortener(url: &Url) -> bool {
         "t.co"
             | "b23.tv"
             | "b23.wtf"
+            | "bili2233.cn"
             | "bit.ly"
             | "tinyurl.com"
             | "xhslink.com"

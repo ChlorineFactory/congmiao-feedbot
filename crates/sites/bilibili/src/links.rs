@@ -76,7 +76,10 @@ pub(super) fn is_bilibili_host(host: &str) -> bool {
 }
 
 pub(super) fn is_short_bili_host(host: &str) -> bool {
-    matches!(host.to_ascii_lowercase().as_str(), "b23.tv" | "b23.wtf")
+    matches!(
+        host.to_ascii_lowercase().as_str(),
+        "b23.tv" | "b23.wtf" | "bili2233.cn"
+    )
 }
 
 /// Host aliases, and `b23.tv/{BV…|av…}` short links whose target is known
@@ -149,4 +152,49 @@ pub(super) async fn expand_if_short(ctx: &ExtractCtx, url: &Url) -> Result<Url, 
 
 pub(super) fn parse_https_url(s: &str) -> Option<Url> {
     Url::parse(&normalize_asset(s)?).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::BilibiliExtractor;
+    use feedbot_core::extract::{Extractor, HttpClient, HttpMethod, HttpRequest, HttpResponse};
+    use feedbot_site_common::NoYtdlp;
+    use http::HeaderMap;
+    use std::sync::Arc;
+
+    const SHORT_URL: &str = "https://bili2233.cn/a1B2c3D";
+
+    struct ShortLinkHttp;
+
+    #[async_trait::async_trait]
+    impl HttpClient for ShortLinkHttp {
+        async fn fetch(&self, request: HttpRequest) -> Result<HttpResponse, ExtractError> {
+            assert_eq!(request.url.as_str(), SHORT_URL);
+            assert!(matches!(request.method, HttpMethod::Head));
+            assert!(request.follow_redirects);
+            Ok(HttpResponse {
+                status: 200,
+                headers: HeaderMap::new(),
+                body: Default::default(),
+                final_url: Url::parse("https://www.bilibili.com/video/BV1xx411c7mD").unwrap(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn expands_bili2233_short_link_to_video() {
+        let http = Arc::new(ShortLinkHttp);
+        let extractor = BilibiliExtractor::new(Default::default(), http.clone(), None);
+        let url = Url::parse(SHORT_URL).unwrap();
+        assert!(extractor.matches(&url));
+        assert!(extractor.rewrite_url(&url).is_none());
+
+        let ctx = ExtractCtx::new(http, Arc::new(NoYtdlp));
+        let target_url = expand_if_short(&ctx, &url).await.unwrap();
+        assert_eq!(
+            parse_target(&target_url),
+            Some(BilibiliTarget::Video("BV1xx411c7mD".into()))
+        );
+    }
 }
